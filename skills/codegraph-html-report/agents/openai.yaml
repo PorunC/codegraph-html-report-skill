@@ -1,0 +1,4 @@
+interface:
+  display_name: "CodeGraph HTML Report"
+  short_description: "Turn local CodeGraph analysis into an offline HTML report."
+  default_prompt: "Use $codegraph-html-report to analyze this project and generate a complete offline HTML report."
