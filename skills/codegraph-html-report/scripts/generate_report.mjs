@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * Build a bounded Markdown architecture report with CodeGraph and render it
- * to a standalone HTML file with the local answer-me-with-html CLI.
+ * Build a bounded multi-page Markdown architecture report with CodeGraph and
+ * render it to offline HTML pages with the local answer-me-with-html CLI.
  */
 
 import fs from 'node:fs';
@@ -38,12 +38,12 @@ function usage() {
 
 Options:
   --project <path>   Project directory (default: current directory)
-  --output <path>    HTML output path (default: .codewiki/reports/...html)
-  --symbol <name>    Entry symbol used to focus analysis; report labels stay at module level
+  --output <path>    Report directory or overview HTML path (default: .codewiki/reports/.../)
+  --symbol <name>    Entry symbol used to focus key call-flow analysis
   --depth <number>   Internal call traversal depth (default: ${DEFAULT_DEPTH})
   --scope <mode>     overview | full | symbol (default: full)
   --supplement <md>  Add architecture notes written from project source review
-  --draft <path>     Keep the generated Markdown draft at this path
+  --draft <path>     Keep page drafts in this directory (or beside this .md path)
   --help             Show this help
 `);
 }
@@ -95,10 +95,6 @@ function escapeCell(value) {
   return String(value ?? '').replaceAll('|', '\\|').replaceAll('\n', ' ');
 }
 
-function escapeInline(value) {
-  return String(value ?? '').replaceAll('`', '\\`');
-}
-
 function relativePath(root, filePath) {
   const value = String(filePath ?? '');
   if (!value) return '';
@@ -148,21 +144,21 @@ function sourceFunctionName(node) {
   if (signatureName) return signatureName;
   const qualifiedTail = String(node?.qualifiedName || '').split(/::|\.|#/).pop().trim();
   if (qualifiedTail && !/^(?:function|method):/i.test(qualifiedTail) && !/^[a-f0-9]{16,}$/i.test(qualifiedTail)) return qualifiedTail;
-  return node?.kind === 'method' ? 'unnamed method' : 'unnamed function';
+  return node?.kind === 'method' ? '未命名方法' : '未命名函数';
 }
 
 function relationLabel(kinds) {
   const labels = {
-    calls: 'calls',
-    imports: 'depends on',
-    exports: 'exports',
-    extends: 'extends',
-    implements: 'implements',
-    instantiates: 'creates',
-    navigates: 'routes to',
+    calls: '调用',
+    imports: '依赖',
+    exports: '导出',
+    extends: '继承',
+    implements: '实现',
+    instantiates: '创建',
+    navigates: '路由到',
   };
   const values = [...new Set((kinds || []).filter(Boolean).map((kind) => labels[kind] || kind))];
-  return values.join(' + ') || 'related modules';
+  return values.join(' + ') || '相关模块';
 }
 
 function nodeModule(root, node) {
@@ -500,10 +496,19 @@ function collectArchitecture(graph, root) {
   };
 }
 
+function serializeCodeNode(root, node) {
+  return {
+    id: node.id,
+    module: nodeModule(root, node),
+    name: sourceFunctionName(node),
+  };
+}
+
 function serializePath(root, pathGraph) {
   return {
-    nodes: pathGraph.nodes.map((node) => ({ id: node.id, module: nodeModule(root, node) })),
-    edges: pathGraph.edges,
+    entry: serializeCodeNode(root, pathGraph.entry),
+    nodes: pathGraph.nodes.map((node) => serializeCodeNode(root, node)),
+    edges: pathGraph.edges.map(({ source, target, kind }) => ({ source, target, kind })),
     truncated: pathGraph.truncated,
   };
 }
@@ -533,15 +538,15 @@ async function buildSnapshot(graph, root, options) {
   });
   const warnings = [];
   const state = graph.getIndexState?.();
-  if (state && state !== 'complete') warnings.push(`CodeGraph index state: ${state}`);
-  if (graph.isIndexStale?.()) warnings.push('The CodeGraph index was built by an older extraction version.');
+  if (state && state !== 'complete') warnings.push(`CodeGraph 索引状态：${state}`);
+  if (graph.isIndexStale?.()) warnings.push('当前索引由较旧的提取版本生成。');
   const pending = graph.getPendingReferenceCount?.() || 0;
-  if (pending) warnings.push(`${pending} references were still pending when the report was generated.`);
-  if (entrySelection.ambiguous) warnings.push('The requested symbol matched multiple definitions; each selected definition has its own path.');
-  if (!entrySelection.selected.length && options.scope !== 'overview') warnings.push('No high-confidence entry symbol was found; the report has no key call path.');
-  if (pathGraphs.some((pathGraph) => pathGraph.truncated)) warnings.push('Some secondary call relationships were folded out of the module flows to keep them readable.');
-  if (architecture.truncated) warnings.push('Some lower-ranked modules or relationships were folded out of the architecture diagram.');
-  if (architecture.fallback) warnings.push('Module architecture uses a file-dependency fallback because this CodeGraph version has no module aggregation result.');
+  if (pending) warnings.push(`生成报告时仍有 ${pending} 条引用待解析。`);
+  if (entrySelection.ambiguous) warnings.push('入口筛选匹配到多个定义，已分别分析各自的调用流程。');
+  if (!entrySelection.selected.length && options.scope !== 'overview') warnings.push('未识别到可信入口，因此没有生成关键调用流程图。');
+  if (pathGraphs.some((pathGraph) => pathGraph.truncated)) warnings.push('部分次要调用分支已折叠，以控制流程图大小。');
+  if (architecture.truncated) warnings.push('架构图折叠了部分低优先级模块或关系。');
+  if (architecture.fallback) warnings.push('当前 CodeGraph 没有可用的模块聚合结果，架构图改用文件依赖关系汇总。');
 
   const unresolved = [];
   let unresolvedCapped = false;
@@ -617,10 +622,10 @@ async function buildSnapshot(graph, root, options) {
         truncated: countsByModule.size > LIMITS.impactModules || impactLinks.size > LIMITS.impactEdges,
       };
     } catch {
-      warnings.push('Impact radius could not be queried for the primary entry symbol.');
+      warnings.push('无法查询所选入口的静态影响范围。');
     }
   }
-  if (impact.truncated) warnings.push('Some lower-ranked modules or relationships were folded out of the impact diagram.');
+  if (impact.truncated) warnings.push('影响图折叠了部分低优先级模块或关系。');
 
   return {
     schemaVersion: 2,
@@ -656,50 +661,51 @@ function flowToken(label) {
   return `[${value.replaceAll(']', '］')}]`;
 }
 
-function architectureMarkdown(snapshot) {
-  const { modules, links } = snapshot.architecture;
-  if (!modules.length || !links.length) return '_No high-confidence cross-module relationships were found._';
+function architectureMarkdown(snapshot, maxLinks = LIMITS.architectureEdges) {
+  const { modules } = snapshot.architecture;
+  const links = snapshot.architecture.links.slice(0, maxLinks);
+  if (!modules.length || !links.length) return '当前索引没有足够可信的跨模块关系可供连线展示，因此不绘制推测关系。';
   const lines = ['```flow LR'];
   for (const link of links) {
     if (link.source && link.target) {
-      const evidence = link.declared ? ` · ${link.declared} direct links` : '';
+      const evidence = link.declared ? ` · ${link.declared} 条关系` : '';
       lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: ${relationLabel(link.kinds || [link.kind])}${evidence}`);
     }
   }
-  lines.push('```', '', `The diagram keeps ${modules.length} high-confidence modules and ${links.length} relationships.`);
+  lines.push('```', '', `图中保留了 ${modules.length} 个高置信度模块和 ${links.length} 条关系。箭头表示静态关系方向，不代表运行时一定按此执行。`);
   lines.push(snapshot.architecture.fallback
-    ? 'Edges use the file-dependency fallback. The module aggregation API did not return a usable result.'
-    : 'This diagram keeps direct module relationships supported by the index and leaves weaker matches out.');
-  if (snapshot.architecture.truncated) lines.push('Some lower-ranked modules or links are omitted.');
+    ? '当前 CodeGraph 版本没有可用的模块聚合结果，因此使用文件依赖关系作为回退依据。'
+    : '连线来自索引中的模块级静态关系；低置信度关系不会绘制。');
+  if (snapshot.architecture.truncated || links.length < snapshot.architecture.links.length) lines.push('部分低优先级模块或关系已折叠。');
   return lines.join('\n');
 }
 
 function projectAreasMarkdown(snapshot) {
   if (!snapshot.directories.length) return '';
-  const lines = ['## Project areas {span=2}', '', '```tree list', `${snapshot.project.name} | indexed source areas`];
+  const lines = ['## 项目主要区域 {span=2}', '', '```tree list', `${snapshot.project.name} | 已索引源码区域`];
   for (const [directory, count] of snapshot.directories) {
     const depth = directory.split('/').length;
     const name = directory.split('/').at(-1);
-    lines.push(`${'  '.repeat(depth)}${name}/ | ${count} indexed file${count === 1 ? '' : 's'}`);
+    lines.push(`${'  '.repeat(depth)}${name}/ | ${count} 个源码文件`);
   }
-  lines.push('```', '', 'This hierarchy groups files by directory; it does not enumerate individual files.');
-  if (snapshot.directoriesTruncated) lines.push('Some lower-ranked folders are omitted from this view.');
+  lines.push('```', '', '这张目录树只显示项目区域和文件数量，不列出单个文件或代码位置。');
+  if (snapshot.directoriesTruncated) lines.push('部分低优先级目录已折叠。');
   return lines.join('\n');
 }
 
 function entrySurfacesMarkdown(snapshot) {
-  if (!snapshot.entries.length) return '';
+  if (!snapshot.entries.length) return '当前索引未识别到可信的入口区域。';
   const modules = new Map();
   for (const entry of snapshot.entries) modules.set(entry.module, (modules.get(entry.module) || 0) + 1);
   const lines = [
-    '## Entry areas {span=2}',
+    '## 入口区域 {span=2}',
     '',
-    'Selected starting points are grouped by module; no individual symbols are listed.',
+    '入口由源码结构和调用关系推断，并按所属模块聚合。',
     '',
     '```flow LR',
   ];
   for (const [module, count] of modules) {
-    lines.push(`${flowToken('selected starts')} -> ${flowToken(module)}: ${count} selected start${count === 1 ? '' : 's'}`);
+    lines.push(`${flowToken('推断入口')} -> ${flowToken(module)}: ${count} 个入口线索`);
   }
   lines.push('```');
   return lines.join('\n');
@@ -707,120 +713,381 @@ function entrySurfacesMarkdown(snapshot) {
 
 function moduleFlowMarkdown(snapshot, options) {
   const paths = snapshot.moduleFlows;
-  if (!paths.length) return '';
+  if (!paths.length) return '当前入口没有形成跨模块调用关系，因此此处不生成空图。';
   const lines = [
-    '## Selected module flows {span=2}',
+    '## 跨模块流程概览 {span=2}',
     '',
-    `Scope: ${options.scope} · downstream depth: ${options.depth} · each flow keeps at most ${LIMITS.pathNodes} internal nodes and ${LIMITS.pathEdges} calls before grouping by module. Only calls crossing module boundaries are drawn.`,
+    `分析范围：${({ overview: '概览', full: '完整', symbol: '指定入口' })[options.scope] || options.scope} · 向下追踪深度：${options.depth}。每条流程最多分析 ${LIMITS.pathNodes} 个调用节点和 ${LIMITS.pathEdges} 条关系；这里只画跨模块调用。`,
   ];
   paths.forEach(({ links, truncated }, index) => {
-    lines.push('', `### Module flow ${index + 1}`, '', '```flow LR');
-    for (const link of links) lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: calls${link.count > 1 ? ` · ${link.count} links` : ''}`);
+    lines.push('', `### 模块流程 ${index + 1}`, '', '```flow LR');
+    for (const link of links) lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: 调用${link.count > 1 ? ` · ${link.count} 条关系` : ''}`);
     lines.push('```');
-    if (truncated) lines.push('', '_Some secondary call relationships were folded out._');
+    if (truncated) lines.push('', '部分次要调用分支已折叠。');
   });
+  return lines.join('\n');
+}
+
+function functionLabels(nodes) {
+  const counts = new Map();
+  for (const node of nodes) {
+    const key = `${node.module}\u0000${node.name}`;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  const occurrences = new Map();
+  const labels = new Map();
+  for (const node of nodes) {
+    const key = `${node.module}\u0000${node.name}`;
+    const occurrence = (occurrences.get(key) || 0) + 1;
+    occurrences.set(key, occurrence);
+    const duplicate = counts.get(key) > 1 ? `（同名 ${occurrence}）` : '';
+    labels.set(node.id, `${node.module} · ${node.name}${duplicate}`);
+  }
+  return labels;
+}
+
+function flowReadingNotes(pathGraph, calls) {
+  const outgoingCounts = new Map();
+  for (const link of calls.values()) {
+    outgoingCounts.set(link.source, (outgoingCounts.get(link.source) || 0) + 1);
+  }
+  const entryCalls = outgoingCounts.get(pathGraph.entry.id) || 0;
+  const branchCount = [...outgoingCounts.values()].filter((count) => count > 1).length;
+  const clauses = [
+    entryCalls
+      ? `入口连出 ${entryCalls} 条已识别的直接调用关系。`
+      : '入口没有解析到直接下游调用。',
+    branchCount
+      ? `图中有 ${branchCount} 个节点连接到多个下游方向，表示存在静态分支线索。`
+      : '图中没有识别到连接多个下游方向的节点。',
+    '箭头只表示静态调用关系；调用条件和运行时顺序需要结合源码逻辑理解。',
+  ];
+  if (pathGraph.truncated) clauses.push('部分次要分支因图表上限未显示。');
+  return `**流程解读：** ${clauses.join(' ')}`;
+}
+
+function functionCallFlowsMarkdown(snapshot, options) {
+  if (options.scope === 'overview') {
+    return '当前选择的是概览模式，没有展开函数调用分析。若要生成关键函数流程图，请使用完整模式或指定入口模式。';
+  }
+  if (!snapshot.paths.length) return '没有识别到可信的调用入口，因此无法生成关键函数流程图。';
+  const lines = [
+    '## 如何阅读 {span=2}',
+    '',
+    `每张图从选中的入口开始，最多向下追踪 ${options.depth} 层；每条流程最多保留 ${LIMITS.pathNodes} 个节点和 ${LIMITS.pathEdges} 条调用关系。节点前缀是模块名，节点末尾保留源码中的函数名。`,
+    '箭头表示 CodeGraph 从源码中识别出的直接调用关系。一个节点连向多个节点表示存在多个静态分支，不代表每次运行都会执行全部分支或固定按图中顺序执行。',
+  ];
+  let diagramCount = 0;
+  for (const [index, pathGraph] of snapshot.paths.entries()) {
+    const labels = functionLabels(pathGraph.nodes);
+    const calls = new Map();
+    for (const edge of pathGraph.edges.filter((item) => item.kind === 'calls')) {
+      if (!labels.has(edge.source) || !labels.has(edge.target)) continue;
+      const key = `${edge.source}\u0000${edge.target}`;
+      const link = calls.get(key) || { source: edge.source, target: edge.target, count: 0 };
+      link.count += 1;
+      calls.set(key, link);
+    }
+    lines.push('', `## 关键流程 ${index + 1} {span=2}`, '');
+    if (!calls.size) {
+      lines.push('这个入口没有解析到可确认的下游调用关系，所以不绘制空图。');
+      continue;
+    }
+    lines.push('```flow LR');
+    for (const link of calls.values()) {
+      const count = link.count > 1 ? ` · ${link.count} 处调用` : '';
+      lines.push(`${flowToken(labels.get(link.source))} -> ${flowToken(labels.get(link.target))}: 调用${count}`);
+    }
+    lines.push('```');
+    lines.push('', flowReadingNotes(pathGraph, calls));
+    lines.push('', `图中保留了 ${pathGraph.nodes.length} 个关键节点和 ${calls.size} 组调用关系。`);
+    diagramCount += 1;
+  }
+  if (!diagramCount) lines.push('', '所有已识别入口都没有可确认的下游调用关系。');
   return lines.join('\n');
 }
 
 function impactMarkdown(snapshot) {
   const { focalModule, modules, edges, depth, truncated } = snapshot.impact;
-  if (!focalModule || !modules.length || !edges.length) return '';
+  if (!focalModule || !modules.length || !edges.length) return '没有发现足够的静态影响关系可画；这不表示运行时一定没有影响。';
   const lines = [
-    '## Static impact by module {span=2}',
+    '## 静态影响范围 {span=2}',
     '',
-    `The selected area has indexed relationships to up to ${modules.length} other project area${modules.length === 1 ? '' : 's'} within depth ${depth}.`,
+    `CodeGraph 在深度 ${depth} 内识别到所选模块与另外 ${modules.length} 个区域之间的静态关系。`,
     '',
     '```flow LR',
   ];
   for (const edge of edges) {
-    const source = edge.source === focalModule ? `selected · ${focalModule}` : edge.source;
-    if (source && edge.target) lines.push(`${flowToken(source)} -> ${flowToken(edge.target)}: ${edge.kind}${edge.count > 1 ? ` · ${edge.count} links` : ''}`);
+    const source = edge.source === focalModule ? `所选区域 · ${focalModule}` : edge.source;
+    const label = edge.kind === 'depends on' ? '依赖' : edge.kind === 'calls' ? '调用' : '可能影响';
+    if (source && edge.target) lines.push(`${flowToken(source)} -> ${flowToken(edge.target)}: ${label}${edge.count > 1 ? ` · ${edge.count} 条关系` : ''}`);
   }
   lines.push('```');
-  if (truncated) lines.push('', '_Some lower-ranked modules or relationships were folded out._');
+  if (truncated) lines.push('', '部分低优先级模块或关系已折叠。');
   return lines.join('\n');
 }
 
 function unresolvedMarkdown(snapshot) {
-  if (!snapshot.unresolved.length) return '';
+  if (!snapshot.unresolved.length) return '在本次选取的调用流程中，没有发现需要单独标出的未解析引用。';
   const lines = [
-    '## Unresolved boundaries {span=2}',
+    '## 未解析引用边界 {span=2}',
     '',
-    `The selected paths have ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} unresolved references across ${snapshot.unresolved.length} project area${snapshot.unresolved.length === 1 ? '' : 's'}. Individual names and source locations are omitted.`,
+    `所选流程中有 ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} 条未解析引用，分布在 ${snapshot.unresolved.length} 个模块。这里按模块汇总，不列出具体名称或源码位置。`,
     '',
     '```flow LR',
   ];
   for (const ref of snapshot.unresolved) {
-    lines.push(`${flowToken(ref.module)} -> ${flowToken('unresolved references')}: ${ref.count} unresolved reference${ref.count === 1 ? '' : 's'}`);
+    lines.push(`${flowToken(ref.module)} -> ${flowToken('未解析引用')}: ${ref.count} 条`);
   }
   lines.push('```');
-  if (snapshot.unresolvedCapped) lines.push('', `_Only the first ${LIMITS.unresolved} unresolved references are shown._`);
+  if (snapshot.unresolvedCapped) lines.push('', `为控制图表大小，只显示前 ${LIMITS.unresolved} 条引用。`);
   return lines.join('\n');
 }
 
-function reportMarkdown(snapshot, options) {
-  const languages = Object.entries(snapshot.stats.filesByLanguage || {}).filter(([, count]) => count).sort((a, b) => b[1] - a[1]);
-  const warningRows = snapshot.warnings.length ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n') : '- The index is complete. No material warnings were reported.';
-  const languagesText = languages.map(([language, count]) => `${language} (${count})`).join(', ') || 'not reported';
-  const supplement = options.supplement ? fs.readFileSync(path.resolve(options.supplement), 'utf8') : '';
-  const scopeSummary = options.scope === 'overview'
-    ? 'Overview scope keeps the report to project structure; call paths and boundary diagrams are intentionally omitted.'
-    : snapshot.entries.length
-      ? `Selected **${snapshot.entries.length} starting area${snapshot.entries.length === 1 ? '' : 's'}** and found **${snapshot.moduleFlows.length} cross-module flow${snapshot.moduleFlows.length === 1 ? '' : 's'}**. Read the diagrams from left to right; they show static relationships, not a runtime trace.`
-      : 'No clear starting area was found automatically. Pass `--symbol <name>` to focus the report.';
-  const unresolvedSummary = options.scope === 'overview'
-    ? '- Unresolved references are not sampled in overview scope.'
-    : snapshot.unresolved.length
-      ? `- ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} unresolved reference(s) are grouped in the unresolved-boundary diagram.`
-      : '- No unresolved references were found in the selected paths.';
-  const areasSection = projectAreasMarkdown(snapshot);
-  const entrySection = entrySurfacesMarkdown(snapshot);
-  const moduleFlowSection = options.scope === 'overview' ? '' : moduleFlowMarkdown(snapshot, options);
-  const impactSection = options.scope === 'overview' ? '' : impactMarkdown(snapshot);
-  const unresolvedSection = options.scope === 'overview' ? '' : unresolvedMarkdown(snapshot);
+const REPORT_PAGES = [
+  { key: 'overview', label: '总览', filename: 'index.html' },
+  { key: 'architecture', label: '架构图', filename: 'architecture.html' },
+  { key: 'flows', label: '函数调用流程', filename: 'call-flows.html' },
+  { key: 'details', label: '影响与边界', filename: 'details.html' },
+];
+
+function navigationMarkdown(currentKey, pages) {
+  const links = REPORT_PAGES.map(({ key, label }) => {
+    if (key === currentKey) return `**${label}**`;
+    return `[${label}](${encodeURI(path.basename(pages[key]))})`;
+  });
+  return `**报告导航：** ${links.join('　·　')}`;
+}
+
+function pageDocument(snapshot, pages, key, heading, subtitle, body) {
   return `---
 template: sheet
 theme: auto
-title: ${quoteYaml(`${snapshot.project.name} · CodeGraph architecture report`)}
-subtitle: ${quoteYaml(`Diagram-first static analysis · ${snapshot.project.analyzedAt}`)}
+lang: zh-CN
+title: ${quoteYaml(`${snapshot.project.name} · ${heading}`)}
+subtitle: ${quoteYaml(`${subtitle} · ${snapshot.project.analyzedAt}`)}
 cols: 2
 ---
-This report is a diagram-first view of **${escapeInline(snapshot.project.name)}**. CodeGraph supplies static relationship evidence; the report keeps project areas, module links, cross-module flows, impact, and unresolved boundaries at architecture level.
+${navigationMarkdown(key, pages)}
 
-## Project at a glance {span=2}
+${body}
+`;
+}
 
-| Files | Languages | Frameworks | Index |
-| ---: | --- | --- | --- |
-| ${snapshot.fileCount} | ${escapeCell(languagesText)} | ${escapeCell(snapshot.project.frameworks.join(', ') || 'none reported')} | ${escapeCell(snapshot.project.indexState || 'unknown')} |
+function statsMarkdown(snapshot) {
+  const languages = Object.entries(snapshot.stats.filesByLanguage || {})
+    .filter(([, count]) => count)
+    .sort((a, b) => b[1] - a[1]);
+  const languagesText = languages.map(([language, count]) => `${language}（${count}）`).join('、') || '未报告';
+  const indexStateLabels = { complete: '已完成', partial: '部分完成', indexing: '正在索引', stale: '已过期' };
+  const rawIndexState = snapshot.project.indexState || '';
+  const indexState = indexStateLabels[rawIndexState] || rawIndexState || '未知';
+  return `| 文件 | 语言 | 框架 | 索引状态 |\n| ---: | --- | --- | --- |\n| ${snapshot.fileCount} | ${escapeCell(languagesText)} | ${escapeCell(snapshot.project.frameworks.join('、') || '未检测到')} | ${escapeCell(indexState)} |`;
+}
 
-${scopeSummary}
+function overviewMarkdown(snapshot, options, pages) {
+  const supplement = options.supplement ? fs.readFileSync(path.resolve(options.supplement), 'utf8') : '';
+  const summary = supplement || `CodeGraph 已索引 ${snapshot.fileCount} 个文件，识别出 ${snapshot.architecture.modules.length} 个高置信度关系模块。下方图表概括目录区域和主要模块关系；具体职责需要结合项目说明与源码阅读。`;
+  const pageRows = REPORT_PAGES.slice(1).map(({ key, label }) => {
+    const descriptions = {
+      architecture: '查看模块组成、依赖方向和跨模块概览。',
+      flows: '查看带源码函数名的关键调用流程，以及分支含义。',
+      details: '查看静态影响范围、未解析引用和分析限制。',
+    };
+    return `| [${label}](${encodeURI(path.basename(pages[key]))}) | ${descriptions[key]} |`;
+  }).join('\n');
+  const body = `# 项目总览
 
-${areasSection}
+## 项目说明 {span=2}
 
-${entrySection}
+${summary}
 
-## Module architecture {span=2}
+## 项目规模 {span=2}
+
+${statsMarkdown(snapshot)}
+
+本报告将函数级关系用于筛选和追踪关键路径；总览与架构图按模块归纳，函数调用图节点保留源码函数名，页面中不列文件和行号清单。
+
+${projectAreasMarkdown(snapshot)}
+
+${entrySurfacesMarkdown(snapshot)}
+
+## 架构速览 {span=2}
+
+${architectureMarkdown(snapshot, 7)}
+
+## 子页面 {span=2}
+
+| 页面 | 阅读内容 |
+| --- | --- |
+${pageRows}
+
+## 阅读提示
+
+所有连线均来自静态源码分析。它们说明源码中识别到的结构关系，不等同于某次运行中的固定执行轨迹。`;
+  return pageDocument(snapshot, pages, 'overview', '项目总览', '项目结构、重点模块和阅读导航', body);
+}
+
+function architecturePageMarkdown(snapshot, options, pages) {
+  const areas = projectAreasMarkdown(snapshot).replace(/^## 项目主要区域 \{span=2\}\n\n/, '') || '索引中没有可展示的目录区域。';
+  const body = `# 项目架构图
+
+## 目录与代码区域 {span=2}
+
+${areas}
+
+## 模块关系图 {span=2}
 
 ${architectureMarkdown(snapshot)}
 
-${moduleFlowSection}
+图中的“依赖、调用、导出”等文字说明模块关系类型。一个模块可能包含多个文件和多项职责；页面只显示聚合后的高置信度关系，不展开单个文件。
 
-${supplement}
+${entrySurfacesMarkdown(snapshot)}
 
-${impactSection}
+${moduleFlowMarkdown(snapshot, options)}
 
-${unresolvedSection}
+## 如何使用这张图
 
-## Reliability and limits
+先从入口区域定位主要起点，再沿箭头查看模块之间的依赖和调用方向。跨模块流程是从函数级调用关系聚合得到的概览；需要查看具体函数名时，打开“函数调用流程”页。`;
+  return pageDocument(snapshot, pages, 'architecture', '项目架构图', '模块组成、关系方向和架构阅读说明', body);
+}
+
+function functionCallFlowsPageMarkdown(snapshot, options, pages) {
+  const body = `# 关键函数调用流程
+
+${functionCallFlowsMarkdown(snapshot, options)}
+
+## 分析边界
+
+CodeGraph 根据静态源码信息识别调用边。动态分派、反射、运行时注入或生成代码可能造成遗漏；流程图用于理解主要路径，不保证覆盖全部运行情况。节点采用源码函数名称，并以模块名帮助区分；页面不附带文件路径或行号清单。`;
+  return pageDocument(snapshot, pages, 'flows', '关键函数调用流程', '保留源码函数名的关键静态调用关系图', body);
+}
+
+function detailsPageMarkdown(snapshot, options, pages) {
+  const warningRows = snapshot.warnings.length
+    ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n')
+    : '- 索引已完成，本次没有其他重要警告。';
+  const body = `# 影响范围与分析边界
+
+${options.scope === 'overview' ? '概览模式不展开影响范围与未解析引用分析。' : impactMarkdown(snapshot)}
+
+${options.scope === 'overview' ? '' : unresolvedMarkdown(snapshot)}
+
+## 本次分析提示 {span=2}
 
 ${warningRows}
 
-- Dynamic dispatch, reflection, generated code, and external package internals may remain unresolved.
-- Test, fixture, documentation, vendor, generated, mock, and build paths are excluded from entry selection and project-area diagrams by default.
-- Obvious language-runtime references such as Boolean or Promise are omitted from the unresolved-boundary diagram.
-- Module edges are aggregated evidence. A static edge does not prove that a path executes at runtime.
-${unresolvedSummary}
-`;
+- 测试、样例、文档、第三方依赖、生成代码、mock 和构建目录会从主要结构图中排除。
+- 明显的语言运行时引用会从未解析引用图中省略，以减少噪声。
+- 静态调用边表示源码分析发现了关系，不代表每次运行都会经过该路径。
+- 图表有节点和关系数量上限；发生折叠时会在对应页面注明。
+
+## 如何理解未解析引用
+
+未解析引用表示 CodeGraph 无法把某个静态引用可靠地连到已索引定义。它可能来自外部依赖、动态调用或索引范围之外的代码；图中按模块计数，不猜测具体目标。`;
+  return pageDocument(snapshot, pages, 'details', '影响与分析边界', '静态影响、未解析引用和索引限制', body);
+}
+
+function buildPageDrafts(snapshot, options, pages) {
+  return {
+    overview: overviewMarkdown(snapshot, options, pages),
+    architecture: architecturePageMarkdown(snapshot, options, pages),
+    flows: functionCallFlowsPageMarkdown(snapshot, options, pages),
+    details: detailsPageMarkdown(snapshot, options, pages),
+  };
+}
+
+function resolveOutputPaths(root, outputArg) {
+  const timestamp = new Date().toISOString().replaceAll(/[:.]/g, '-');
+  const requested = path.resolve(outputArg || path.join(root, '.codewiki', 'reports', `codegraph-report-${timestamp}`));
+  const extension = path.extname(requested);
+  if (extension.toLowerCase() === '.html') {
+    const basename = path.basename(requested);
+    const stem = basename.slice(0, -extension.length);
+    const directory = path.dirname(requested);
+    return {
+      directory,
+      pages: {
+        overview: requested,
+        architecture: path.join(directory, `${stem}-architecture.html`),
+        flows: path.join(directory, `${stem}-call-flows.html`),
+        details: path.join(directory, `${stem}-details.html`),
+      },
+    };
+  }
+  return {
+    directory: requested,
+    pages: Object.fromEntries(REPORT_PAGES.map(({ key, filename }) => [key, path.join(requested, filename)])),
+  };
+}
+
+function resolveDraftPaths(root, draftArg, pid) {
+  if (!draftArg) {
+    const directory = path.join(root, '.codewiki', 'tmp', `codegraph-report-${pid}`);
+    return { directory, cleanup: true, pages: Object.fromEntries(REPORT_PAGES.map(({ key, filename }) => [key, path.join(directory, filename.replace(/\.html$/, '.md'))])) };
+  }
+  const requested = path.resolve(draftArg);
+  const extension = path.extname(requested);
+  if (extension.toLowerCase() === '.md') {
+    const basename = path.basename(requested);
+    const stem = basename.slice(0, -extension.length);
+    const directory = path.dirname(requested);
+    return {
+      directory,
+      cleanup: false,
+      pages: {
+        overview: requested,
+        architecture: path.join(directory, `${stem}-architecture.md`),
+        flows: path.join(directory, `${stem}-call-flows.md`),
+        details: path.join(directory, `${stem}-details.md`),
+      },
+    };
+  }
+  return {
+    directory: requested,
+    cleanup: false,
+    pages: Object.fromEntries(REPORT_PAGES.map(({ key, filename }) => [key, path.join(requested, filename.replace(/\.html$/, '.md'))])),
+  };
+}
+
+function renderPageSet(drafts, output, expectedTitles) {
+  const stagingDirectory = path.join(output.directory, `.codegraph-html-report-${process.pid}-staging`);
+  fs.rmSync(stagingDirectory, { recursive: true, force: true });
+  fs.mkdirSync(stagingDirectory, { recursive: true });
+  try {
+    for (const { key } of REPORT_PAGES) {
+      const stagedHtml = path.join(stagingDirectory, path.basename(output.pages[key]));
+      renderMarkdown(drafts[key], stagedHtml);
+      if (!fs.existsSync(stagedHtml) || fs.statSync(stagedHtml).size === 0) throw new Error(`渲染器没有生成有效页面：${key}`);
+      sanitizeOfflineHtml(stagedHtml);
+      const html = fs.readFileSync(stagedHtml, 'utf8');
+      if (!/<title>[^<]+<\/title>/i.test(html) || !html.includes(expectedTitles[key])) {
+        throw new Error(`页面标题缺失或不完整：${key}`);
+      }
+    }
+    validateLocalPageLinks(stagingDirectory, output.pages);
+    for (const { key } of REPORT_PAGES) {
+      fs.renameSync(path.join(stagingDirectory, path.basename(output.pages[key])), output.pages[key]);
+    }
+  } finally {
+    fs.rmSync(stagingDirectory, { recursive: true, force: true });
+  }
+}
+
+function validateLocalPageLinks(directory, pages) {
+  const pageNames = new Set(Object.values(pages).map((page) => path.basename(page)));
+  for (const pageName of pageNames) {
+    const html = fs.readFileSync(path.join(directory, pageName), 'utf8');
+    const links = [...html.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)];
+    for (const [, href] of links) {
+      if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(href)) continue;
+      const target = decodeURIComponent(href.split(/[?#]/, 1)[0]);
+      if (!target) continue;
+      if (!pageNames.has(path.basename(target)) || !fs.existsSync(path.resolve(directory, target))) {
+        throw new Error(`页面包含无法访问的本地链接：${pageName} → ${href}`);
+      }
+    }
+  }
 }
 
 function findAmBinary() {
@@ -855,34 +1122,34 @@ function sanitizeOfflineHtml(filePath) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const root = ensureProject(args.project);
-  const output = path.resolve(args.output || path.join(root, '.codewiki', 'reports', `codegraph-report-${new Date().toISOString().replaceAll(/[:.]/g, '-')}.html`));
-  const draft = path.resolve(args.draft || path.join(root, '.codewiki', 'tmp', `codegraph-report-${process.pid}.md`));
-  fs.mkdirSync(path.dirname(output), { recursive: true });
-  fs.mkdirSync(path.dirname(draft), { recursive: true });
+  const output = resolveOutputPaths(root, args.output);
+  const drafts = resolveDraftPaths(root, args.draft, process.pid);
+  fs.mkdirSync(output.directory, { recursive: true });
+  fs.mkdirSync(drafts.directory, { recursive: true });
   const CodeGraph = await loadCodeGraph();
   let graph;
-  let rendered;
   try {
     graph = CodeGraph.isInitialized(root)
       ? await CodeGraph.open(root, { sync: true })
       : await CodeGraph.init(root, { index: true, onProgress: progressPrinter });
     const snapshot = await buildSnapshot(graph, root, args);
-    fs.writeFileSync(draft, reportMarkdown(snapshot, args), 'utf8');
-    rendered = `${output}.tmp-${process.pid}`;
-    fs.rmSync(rendered, { force: true });
-    renderMarkdown(draft, rendered);
-    if (!fs.existsSync(rendered) || fs.statSync(rendered).size === 0) throw new Error('Renderer produced an empty HTML file.');
-    sanitizeOfflineHtml(rendered);
-    const html = fs.readFileSync(rendered, 'utf8');
-    if (!/<title>[^<]+<\/title>/i.test(html) || !html.includes('CodeGraph architecture report')) {
-      throw new Error('Generated HTML is missing the expected report title.');
+    const pageDrafts = buildPageDrafts(snapshot, args, output.pages);
+    for (const { key } of REPORT_PAGES) {
+      fs.writeFileSync(drafts.pages[key], pageDrafts[key], 'utf8');
     }
-    fs.renameSync(rendered, output);
-    console.log(JSON.stringify({ output, project: snapshot.project.name, stats: snapshot.stats, warnings: snapshot.warnings }, null, 2));
+    const expectedTitles = Object.fromEntries(REPORT_PAGES.map(({ key }) => [key, pageDrafts[key].match(/^title: "([^"]+)/m)?.[1] || snapshot.project.name]));
+    renderPageSet(drafts.pages, output, expectedTitles);
+    console.log(JSON.stringify({
+      output: output.pages.overview,
+      reportDirectory: output.directory,
+      pages: output.pages,
+      project: snapshot.project.name,
+      stats: snapshot.stats,
+      warnings: snapshot.warnings,
+    }, null, 2));
   } finally {
     try { graph?.close(); } catch { /* best effort */ }
-    if (!args.draft) fs.rmSync(draft, { force: true });
-    if (rendered) fs.rmSync(rendered, { force: true });
+    if (drafts.cleanup) fs.rmSync(drafts.directory, { recursive: true, force: true });
   }
 }
 

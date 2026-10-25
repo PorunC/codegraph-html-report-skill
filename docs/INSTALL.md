@@ -102,7 +102,7 @@ node "$CODEX_SKILLS_DIR/codegraph-html-report/scripts/generate_report.mjs" --hel
 进入需要分析的项目目录，在 Codex 中发送：
 
 ```text
-使用 $codegraph-html-report 分析当前项目，并生成完整的 HTML 架构文档。
+使用 $codegraph-html-report 分析当前项目，并生成包含总览、架构图和关键函数调用流程的 HTML 报告。
 ```
 
 指定项目路径：
@@ -111,10 +111,10 @@ node "$CODEX_SKILLS_DIR/codegraph-html-report/scripts/generate_report.mjs" --hel
 使用 $codegraph-html-report 分析 /Users/me/Projects/my-app，并生成完整的 HTML 架构文档。
 ```
 
-指定焦点符号、深度和输出位置：
+指定焦点符号、深度和报告目录：
 
 ```text
-使用 $codegraph-html-report 分析当前项目，围绕 main 展开 3 层调用关系，并将报告保存到 docs/codegraph.html。
+使用 $codegraph-html-report 分析当前项目，围绕 main 展开 3 层关键调用流程，并将报告保存到 docs/codegraph-report/。
 ```
 
 Skill 会先阅读项目的 README、包管理文件、配置文件和明显入口，再把这些信息作为架构补充说明传给报告生成器。它默认使用当前工作目录，也支持用户提供项目路径。
@@ -133,7 +133,7 @@ REPORT_SKILL_DIR="$CODEX_SKILLS_DIR/codegraph-html-report"
 ```bash
 node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
   --project /path/to/project \
-  --output /path/to/project/.codewiki/reports/codegraph.html
+  --output /path/to/project/.codewiki/reports/my-project-report
 ```
 
 如果从本仓库目录运行，也可以直接使用：
@@ -149,14 +149,14 @@ node skills/codegraph-html-report/scripts/generate_report.mjs \
 | 参数 | 默认值 | 用途 |
 | --- | --- | --- |
 | `--project <path>` | 当前目录 | 指定要分析的项目目录 |
-| `--output <path>` | `.codewiki/reports/codegraph-report-<timestamp>.html` | 指定 HTML 文件路径 |
-| `--symbol <name>` | 自动选择 | 指定用于筛选入口的符号，报告仍按模块展示 |
+| `--output <path>` | `.codewiki/reports/codegraph-report-<timestamp>/` | 指定报告目录；指定 `.html` 时，该文件作为总览页，其余页面以相同文件名开头生成在旁边 |
+| `--symbol <name>` | 自动选择 | 指定关键调用流程的入口符号，流程图显示源码函数名 |
 | `--depth <1-6>` | `2` | 设置内部调用关系和影响范围深度 |
 | `--scope full` | `full` | 生成完整报告 |
-| `--scope overview` | — | 只生成概览和目录结构，不展开调用关系 |
+| `--scope overview` | — | 不展开调用关系；函数流程子页会说明此范围限制 |
 | `--scope symbol` | — | 围绕 `--symbol` 生成报告 |
 | `--supplement <md>` | 无 | 加入额外架构说明 Markdown |
-| `--draft <path>` | 自动临时文件 | 保留 Markdown 草稿，便于调试格式 |
+| `--draft <path>` | 自动临时目录 | 保留四份 Markdown 草稿；可指定目录或总览 `.md` 路径 |
 
 示例：
 
@@ -166,7 +166,7 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
   --symbol App.run \
   --depth 3 \
   --scope symbol \
-  --output ./my-project/docs/module-flow.html
+  --output ./my-project/docs/codegraph-report
 ```
 
 ## 查看结果
@@ -174,30 +174,37 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
 默认报告生成在：
 
 ```text
-<项目目录>/.codewiki/reports/codegraph-report-<timestamp>.html
+<项目目录>/.codewiki/reports/codegraph-report-<timestamp>/index.html
 ```
 
-报告是自包含 HTML，可以直接打开：
+报告由四个自包含 HTML 页面组成。直接打开总览页即可：
 
-报告以图为主：默认展示项目区域和模块关系，不输出具体函数、文件和行号清单；CodeGraph 的内部 ID 也不会直接展示。目录图会过滤测试、构建、生成和第三方目录，避免主结构被噪声淹没。
+| 页面 | 内容 |
+| --- | --- |
+| `index.html` | 项目摘要、代码区域、入口概览、架构速览和子页面导航 |
+| `architecture.html` | 目录树、模块依赖、入口区域和跨模块流程 |
+| `call-flows.html` | 关键函数调用图，使用源码函数名，并说明调用方向和分支 |
+| `details.html` | 静态影响范围、未解析引用和分析限制 |
+
+报告以图为主：总览与架构页按模块展示；少量源码函数名只作为关键调用流程图的节点，正文不重复列函数清单。所有页都不列具体文件和行号清单，CodeGraph 内部 ID 不会展示。页面间通过相对链接导航，打开 `index.html` 即可离线浏览整个报告。目录图会过滤测试、构建、生成和第三方目录，避免主结构被噪声淹没。若 `--output` 指定为 `docs/codegraph.html`，其余页面会以 `codegraph-architecture.html`、`codegraph-call-flows.html` 和 `codegraph-details.html` 的名称生成在同目录。
 
 ```bash
 # macOS
-open /path/to/project/.codewiki/reports/codegraph-report-<timestamp>.html
+open /path/to/project/.codewiki/reports/codegraph-report-<timestamp>/index.html
 
 # Linux
-xdg-open /path/to/project/.codewiki/reports/codegraph-report-<timestamp>.html
+xdg-open /path/to/project/.codewiki/reports/codegraph-report-<timestamp>/index.html
 ```
 
-Windows 可以在文件管理器中双击 HTML 文件，或在 PowerShell 中执行 `Start-Process 'C:\path\to\codegraph.html'`。报告不依赖 HTTP 服务或外部网络资源。
+Windows 可以在文件管理器中双击 `index.html`，或在 PowerShell 中执行 `Start-Process 'C:\path\to\report\index.html'`。报告不依赖 HTTP 服务或外部网络资源。
 
 ## 生成过程和本地文件
 
 运行时会在被分析项目中创建或更新：
 
 - `.codegraph/`：CodeGraph 的本地索引
-- `.codewiki/reports/`：最终 HTML 报告
-- `.codewiki/tmp/`：生成过程中的临时 Markdown，成功后会清理
+- `.codewiki/reports/<报告名>/`：总览、架构、函数调用流程、影响与边界四个 HTML 页面
+- `.codewiki/tmp/`：生成过程中的 Markdown 草稿，成功后会清理
 
 如果不希望把这些生成物提交到项目 Git 仓库，可以加入：
 
@@ -255,7 +262,7 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
 
 - 分析范围是本地目录
 - 报告生成不上传源码
-- 报告默认不嵌入源码片段、具体函数名或文件位置清单
+- 仅关键调用流程图显示少量源码函数名；不嵌入源码片段，不生成函数清单或文件位置清单
 - 生成的 HTML 经过检查，不保留外部 `http(s)` 资源引用
 
 公开分享报告前，仍建议检查其中的项目名称、模块名称和业务名称。
