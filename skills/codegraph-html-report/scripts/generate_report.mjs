@@ -151,7 +151,8 @@ async function loadCodeGraph() {
 }
 
 function nodeLabel(node) {
-  return node?.qualifiedName || node?.name || node?.id || 'unknown';
+  if (isCodeNode(node)) return sourceFunctionName(node);
+  return node?.name || node?.qualifiedName || 'unknown';
 }
 
 function normalizeFilePath(filePath) {
@@ -170,8 +171,44 @@ function isCodeNode(node) {
   return Boolean(node?.id && CODE_KINDS.has(node.kind));
 }
 
-function nodeShortName(node) {
-  return node?.name || node?.qualifiedName?.split(/::|\.|#/).pop() || node?.id || 'unknown';
+function sourceFunctionName(node) {
+  const sourceName = String(node?.name || '').trim();
+  if (sourceName && !/^(?:function|method):/i.test(sourceName)) return sourceName;
+  const signatureName = String(node?.signature || '').match(/(?:function\s+|fn\s+)?([A-Za-z_$][\w$]*)\s*\(/)?.[1];
+  if (signatureName) return signatureName;
+  const qualifiedTail = String(node?.qualifiedName || '').split(/::|\.|#/).pop().trim();
+  if (qualifiedTail && !/^(?:function|method):/i.test(qualifiedTail) && !/^[a-f0-9]{16,}$/i.test(qualifiedTail)) return qualifiedTail;
+  return node?.kind === 'method' ? 'unnamed method' : 'unnamed function';
+}
+
+function entryReasonLabel(reason) {
+  const labels = {
+    'explicit symbol': 'requested symbol',
+    'explicit symbol search': 'requested symbol search',
+    'executable file root': 'top-level executable file',
+    'exported symbol': 'exported entry',
+    'indexed route': 'route entry',
+    'indexed component': 'component entry',
+    'conventional entry name': 'conventional entry name',
+    'fallback symbol search': 'name-search fallback',
+    'no incoming call edge': 'no indexed callers',
+    'has downstream calls': 'calls indexed functions',
+  };
+  return labels[reason] || reason;
+}
+
+function relationLabel(kinds) {
+  const labels = {
+    calls: 'calls',
+    imports: 'depends on',
+    exports: 'exports',
+    extends: 'extends',
+    implements: 'implements',
+    instantiates: 'creates',
+    navigates: 'routes to',
+  };
+  const values = [...new Set((kinds || []).filter(Boolean).map((kind) => labels[kind] || kind))];
+  return values.join(' + ') || 'related modules';
 }
 
 function nodeLocation(root, node) {
@@ -216,7 +253,7 @@ function discoverEntryCandidates(graph) {
       let score = fileScore;
       if (node.kind === 'route' || node.kind === 'component') score += 12;
       if (node.isExported) score += 5;
-      if (/^(main|run|start|serve|cli|execute|handle|process|bootstrap|init)$/i.test(nodeShortName(node))) score += 4;
+      if (/^(main|run|start|serve|cli|execute|handle|process|bootstrap|init)$/i.test(sourceFunctionName(node))) score += 4;
       addCandidate(candidates, node, 'executable file root', score);
     }
   }
@@ -224,7 +261,7 @@ function discoverEntryCandidates(graph) {
     for (const node of graph.getNodesByKind?.(kind) || []) addCandidate(candidates, node, `indexed ${kind}`, 20);
   }
   for (const node of graph.getNodesByKind?.('function') || []) {
-    if (node.isExported || /^(main|run|start|serve|cli|execute|handle|process|bootstrap|init)$/i.test(nodeShortName(node))) {
+    if (node.isExported || /^(main|run|start|serve|cli|execute|handle|process|bootstrap|init)$/i.test(sourceFunctionName(node))) {
       addCandidate(candidates, node, node.isExported ? 'exported symbol' : 'conventional entry name', node.isExported ? 14 : 10);
     }
   }
@@ -332,7 +369,7 @@ function relationshipScore(relationship, source, target, root, fanOut) {
   if (target.kind === 'route' || target.kind === 'component') score += 3;
   if (nodeModule(root, source) !== nodeModule(root, target)) score += 4;
   score += Math.min(fanOut.get(target.id) || 0, 8) * 0.35;
-  if (/^(get|set|is|has|to|from|format|parse|log|debug|validate|normalize)$/i.test(nodeShortName(target))) score -= 2;
+  if (/^(get|set|is|has|to|from|format|parse|log|debug|validate|normalize)$/i.test(sourceFunctionName(target))) score -= 2;
   return score;
 }
 
@@ -494,7 +531,7 @@ function serializeNode(root, node) {
   return {
     ...node,
     filePath: relativePath(root, node.filePath),
-    shortName: nodeShortName(node),
+    shortName: sourceFunctionName(node),
     location: nodeLocation(root, node),
     module: nodeModule(root, node),
   };
@@ -608,7 +645,7 @@ async function buildSnapshot(graph, root, options) {
     },
     stats,
     directories: [...files.directories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12),
-    fileCount: files.paths.length || stats.fileCount,
+    fileCount: stats.fileCount ?? files.paths.length,
     architecture,
     entries: entrySelection.selected.map((entry) => ({
       ...serializeNode(root, entry.node),
@@ -625,26 +662,49 @@ async function buildSnapshot(graph, root, options) {
   };
 }
 
-function diagramId(value, index) {
-  const stem = String(value ?? '').replace(/[^a-zA-Z0-9_]/g, '_').slice(0, 18) || 'node';
-  return `${stem}_${index}`;
+function displayLabels(nodes) {
+  const counts = new Map();
+  for (const node of nodes) counts.set(node.shortName, (counts.get(node.shortName) || 0) + 1);
+  const used = new Set();
+  const occurrences = new Map();
+  const labels = new Map();
+  for (const node of nodes) {
+    const base = node.shortName || 'unknown';
+    const location = `${node.filePath}:${node.startLine ?? '?'}`;
+    const occurrence = (occurrences.get(base) || 0) + 1;
+    occurrences.set(base, occurrence);
+    let label = counts.get(base) > 1 ? `${base} · ${location}` : base;
+    if (used.has(label)) label = `${base} · ${location} (${occurrence})`;
+    used.add(label);
+    labels.set(node.id, label);
+  }
+  return labels;
+}
+
+function flowToken(label) {
+  const value = String(label ?? '').trim() || 'unknown';
+  if (/^[A-Za-z0-9_.$/-]+$/.test(value)) return value;
+  if (!value.includes(']')) return `[${value}]`;
+  if (!value.includes(')')) return `(${value})`;
+  if (!value.includes('}')) return `{${value}}`;
+  return `[${value.replaceAll(']', '］')}]`;
 }
 
 function architectureMarkdown(snapshot) {
   const { modules, links } = snapshot.architecture;
   if (!modules.length || !links.length) return '_No high-confidence cross-module relationships were found._';
-  const ids = new Map(modules.map((module, index) => [module.name, diagramId(module.name, index)]));
   const lines = ['```flow LR'];
   for (const link of links) {
-    const source = ids.get(link.source);
-    const target = ids.get(link.target);
-    if (source && target) lines.push(`${source} -> ${target}: ${(link.kinds || [link.kind]).join('/')} ${link.declared ? `· ${link.declared} direct` : ''}`.trim());
+    if (link.source && link.target) {
+      const evidence = link.declared ? ` · ${link.declared} direct links` : '';
+      lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: ${relationLabel(link.kinds || [link.kind])}${evidence}`);
+    }
   }
   lines.push('```', '', '| Module | Indexed files |', '| --- | ---: |');
-  for (const module of modules) lines.push(`| ${escapeCell(ids.get(module.name))} · ${escapeCell(module.name)} | ${module.files} |`);
+  for (const module of modules) lines.push(`| ${escapeCell(module.name)} | ${module.files} |`);
   lines.push('', snapshot.architecture.fallback
     ? 'Edges use the file-dependency fallback. The module aggregation API did not return a usable result.'
-    : 'Edges use the module-level CodeGraph aggregation. Direct edges are preferred over low-confidence name matches.');
+    : 'This diagram keeps direct module relationships supported by the index and leaves weaker matches out.');
   return lines.join('\n');
 }
 
@@ -652,18 +712,18 @@ function pathMarkdown(pathGraph, index) {
   const nodes = pathGraph.nodes;
   const edges = pathGraph.edges.filter((edge) => edge.kind === 'calls');
   const title = `${pathGraph.entry.shortName} · ${pathGraph.entry.location}`;
-  if (!edges.length) return `### Path ${index + 1}: ${inlineCode(title)}\n\n_No resolved downstream calls were found for this entry._`;
-  const ids = new Map(nodes.map((node, nodeIndex) => [node.id, diagramId(node.shortName, nodeIndex)]));
-  const lines = [`### Path ${index + 1}: ${inlineCode(title)}`, '', '```flow LR'];
+  if (!edges.length) return `### Main path ${index + 1}: ${inlineCode(title)}\n\n_No resolved downstream calls were found for this entry._`;
+  const labels = displayLabels(nodes);
+  const lines = [`### Main path ${index + 1}: ${inlineCode(title)}`, '', '```flow LR'];
   for (const edge of edges) {
-    const source = ids.get(edge.source);
-    const target = ids.get(edge.target);
-    if (source && target) lines.push(`${source} -> ${target}: ${edge.line ? `line ${edge.line}` : 'calls'}`);
+    const source = labels.get(edge.source);
+    const target = labels.get(edge.target);
+    if (source && target) lines.push(`${flowToken(source)} -> ${flowToken(target)}: calls${edge.line ? ` · line ${edge.line}` : ''}`);
   }
-  lines.push('```', '', '| Node | Module · function | Location |', '| --- | --- | --- |');
+  lines.push('```', '', '| Function | Module | Location |', '| --- | --- | --- |');
   for (const node of nodes) {
-    const id = ids.get(node.id);
-    if (id) lines.push(`| ${escapeCell(id)} | ${escapeCell(node.module)} · ${escapeCell(node.shortName)} | ${escapeCell(node.location)} |`);
+    const label = labels.get(node.id);
+    if (label) lines.push(`| ${escapeCell(label)} | ${escapeCell(node.module)} | ${escapeCell(node.location)} |`);
   }
   if (pathGraph.truncated) lines.push('', '_Secondary callees were folded out to keep this path readable._');
   return lines.join('\n');
@@ -672,12 +732,13 @@ function pathMarkdown(pathGraph, index) {
 function sourceBlocks(snapshot) {
   const blocks = [];
   const seen = new Set();
+  const labels = displayLabels(snapshot.symbols);
   for (const symbol of snapshot.symbols) {
     if (!symbol.source || seen.has(symbol.id)) continue;
     seen.add(symbol.id);
     const language = languageFor(symbol.filePath);
     blocks.push(
-      `### ${escapeInline(symbol.module)} · ${escapeInline(symbol.shortName)}\n\n\`${symbol.kind}\` · \`${escapeInline(symbol.location)}\`\n\n\`\`\`${language} title="${escapeInline(symbol.location)}"\n${safeCode(symbol.source)}\n\`\`\``,
+      `### ${escapeInline(symbol.module)} · ${escapeInline(labels.get(symbol.id) || symbol.shortName)}\n\n\`${symbol.kind}\` · \`${escapeInline(symbol.location)}\`\n\n\`\`\`${language} title="${escapeInline(symbol.location)}"\n${safeCode(symbol.source)}\n\`\`\``,
     );
   }
   return blocks.join('\n\n') || '_No source excerpt was needed for the selected paths._';
@@ -685,75 +746,52 @@ function sourceBlocks(snapshot) {
 
 function reportMarkdown(snapshot, options) {
   const languages = Object.entries(snapshot.stats.filesByLanguage || {}).filter(([, count]) => count).sort((a, b) => b[1] - a[1]);
-  const entryRows = snapshot.entries.map((entry) => `| ${escapeCell(entry.module)} · ${escapeCell(entry.shortName)} | ${escapeCell(entry.location)} | ${escapeCell(entry.reasons.join(', '))} |`).join('\n');
+  const entryRows = snapshot.entries.map((entry) => `| ${escapeCell(entry.module)} · ${escapeCell(entry.shortName)} | ${escapeCell(entry.location)} | ${escapeCell([...new Set(entry.reasons.map(entryReasonLabel))].join(', '))} |`).join('\n');
   const impactRows = snapshot.impact.nodes.length
     ? snapshot.impact.nodes.map((node) => `| ${escapeCell(node.module)} · ${escapeCell(node.shortName)} | ${escapeCell(node.location)} |`).join('\n')
     : '| _(no additional static impact nodes returned)_ | |';
   const unresolvedRows = snapshot.unresolved.length
     ? snapshot.unresolved.map((ref) => `| ${escapeCell(ref.referenceName)} | ${escapeCell(ref.filePath)}:${ref.line ?? '?'} | ${escapeCell(ref.owner)} |`).join('\n')
     : '| _(none sampled from the selected paths)_ | | |';
-  const warningRows = snapshot.warnings.length ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n') : '- No material indexing warnings were reported.';
+  const warningRows = snapshot.warnings.length ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n') : '- The index is complete. No material warnings were reported.';
   const languagesText = languages.map(([language, count]) => `${language} (${count})`).join(', ') || 'not reported';
   const supplement = options.supplement ? fs.readFileSync(path.resolve(options.supplement), 'utf8') : '';
-  const selectedPathText = snapshot.paths.length ? `${snapshot.paths.length} focused path${snapshot.paths.length === 1 ? '' : 's'}` : 'no focused path';
-  return `---
-template: sheet
-theme: auto
-title: ${quoteYaml(`${snapshot.project.name} · CodeGraph architecture report`)}
-subtitle: ${quoteYaml(`Focused static analysis · ${snapshot.project.analyzedAt}`)}
-cols: 2
----
-This report explains the most important structure found in **${escapeInline(snapshot.project.name)}**. CodeGraph supplies precise static evidence; the report keeps only high-confidence modules, entries, and downstream paths.
-
-## Project at a glance {span=2}
-
-| Files | Languages | Frameworks | Index |
-| ---: | --- | --- | --- |
-| ${snapshot.fileCount} | ${escapeCell(languagesText)} | ${escapeCell(snapshot.project.frameworks.join(', ') || 'none reported')} | ${escapeCell(snapshot.project.indexState || 'unknown')} |
-
-${snapshot.entries.length ? `The analysis selected **${snapshot.entries.length}** entry candidate(s) and ${selectedPathText}. The diagrams show static call evidence, not a runtime trace.` : 'No high-confidence entry was found automatically. Pass `--symbol <name>` to focus the report.'}
-
-## Entry points
-
-| Candidate | Location | Evidence used |
-| --- | --- | --- |
-${entryRows || '| _(none selected)_ | | |'}
-
-## Module architecture {span=2}
-
-${architectureMarkdown(snapshot)}
-
+  const entrySummary = snapshot.entries.length === 1 ? '1 entry candidate' : `${snapshot.entries.length} entry candidates`;
+  const pathSummary = snapshot.paths.length === 1 ? '1 focused path' : `${snapshot.paths.length} focused paths`;
+  const scopeSummary = options.scope === 'overview'
+    ? 'Overview scope keeps the report to project structure; call paths and source excerpts are intentionally omitted.'
+    : snapshot.entries.length
+      ? `The analysis selected **${entrySummary}** and **${pathSummary}**. The diagrams show static call evidence, not a runtime trace.`
+      : 'No high-confidence entry was found automatically. Pass `--symbol <name>` to focus the report.';
+  const unresolvedSummary = options.scope === 'overview'
+    ? '- Unresolved references are not sampled in overview scope.'
+    : snapshot.unresolved.length
+      ? `- ${snapshot.unresolved.length} unresolved reference(s) were found in the selected paths; see the final panel.`
+      : '- No unresolved references were found in the selected paths.';
+  const pathSection = options.scope === 'overview' ? '' : `
 ## Key call paths {span=2}
 
-Scope: ${inlineCode(options.scope)} · traversal depth: ${inlineCode(options.depth)} · each path keeps at most ${LIMITS.pathNodes} nodes and ${LIMITS.pathEdges} edges.
+Focus: ${inlineCode(options.scope)} · downstream depth: ${inlineCode(options.depth)} · each path keeps at most ${LIMITS.pathNodes} functions and ${LIMITS.pathEdges} calls.
 
-${snapshot.paths.map((pathGraph, index) => pathMarkdown(pathGraph, index)).join('\n\n') || '_Call paths are omitted in overview scope or were not resolved._'}
-
+${snapshot.paths.map((pathGraph, index) => pathMarkdown(pathGraph, index)).join('\n\n') || '_No downstream call path was resolved._'}
+`;
+  const sourceSection = snapshot.symbols.some((symbol) => symbol.source) ? `
 ## Focused source evidence
 
 Only symbols used by the selected paths are shown. Each excerpt is limited to ${LIMITS.snippetLines} lines.
 
 ${sourceBlocks(snapshot)}
+` : '';
+  const impactSection = snapshot.impact.focal && snapshot.impact.nodes.length ? `
+## Change impact
 
-${supplement}
-
-## Change impact (static)
-
-${snapshot.impact.focal ? `For the primary entry ${inlineCode(snapshot.impact.focal.shortName)} at ${inlineCode(snapshot.impact.focal.location)}, CodeGraph returned ${snapshot.impact.nodes.length} nearby symbols at depth ${options.depth}.` : 'No primary entry was available for an impact query.'}
+Changing ${inlineCode(snapshot.impact.focal.shortName)} at ${inlineCode(snapshot.impact.focal.location)} may affect these indexed symbols at depth ${options.depth}.
 
 | Related symbol | Location |
 | --- | --- |
 ${impactRows}
-
-## Important limits
-
-${warningRows}
-
-- Dynamic dispatch, reflection, generated code, and external package internals may remain unresolved.
-- Test, vendor, generated, and build paths are excluded from entry selection and path diagrams by default.
-- Obvious language-runtime references such as Boolean or Promise are omitted from the unresolved-reference table.
-- Module edges are aggregated evidence. A static edge does not prove that a path executes at runtime.
-
+` : '';
+  const unresolvedSection = snapshot.unresolved.length ? `
 ## Unresolved references
 
 Only unresolved references attached to selected path symbols are shown, capped at ${LIMITS.unresolved} rows.
@@ -761,6 +799,56 @@ Only unresolved references attached to selected path symbols are shown, capped a
 | Reference | Location | Referencing symbol |
 | --- | --- | --- |
 ${unresolvedRows}
+` : '';
+  const entrySection = snapshot.entries.length ? `
+## Entry points
+
+| Candidate | Location | Why selected |
+| --- | --- | --- |
+${entryRows}
+` : '';
+  return `---
+template: sheet
+theme: auto
+title: ${quoteYaml(`${snapshot.project.name} · CodeGraph architecture report`)}
+subtitle: ${quoteYaml(`Focused static analysis · ${snapshot.project.analyzedAt}`)}
+cols: 2
+---
+This report explains the most important structure found in **${escapeInline(snapshot.project.name)}**. CodeGraph supplies static relationship evidence; the report keeps only high-confidence modules, entries, and downstream paths.
+
+## Project at a glance {span=2}
+
+| Files | Languages | Frameworks | Index |
+| ---: | --- | --- | --- |
+| ${snapshot.fileCount} | ${escapeCell(languagesText)} | ${escapeCell(snapshot.project.frameworks.join(', ') || 'none reported')} | ${escapeCell(snapshot.project.indexState || 'unknown')} |
+
+${scopeSummary}
+
+${entrySection}
+
+## Module architecture {span=2}
+
+${architectureMarkdown(snapshot)}
+
+${pathSection}
+
+${sourceSection}
+
+${supplement}
+
+${impactSection}
+
+## Reliability and limits
+
+${warningRows}
+
+- Dynamic dispatch, reflection, generated code, and external package internals may remain unresolved.
+- Test, vendor, generated, and build paths are excluded from entry selection and path diagrams by default.
+- Obvious language-runtime references such as Boolean or Promise are omitted from the unresolved-reference table.
+- Module edges are aggregated evidence. A static edge does not prove that a path executes at runtime.
+${unresolvedSummary}
+
+${unresolvedSection}
 `;
 }
 

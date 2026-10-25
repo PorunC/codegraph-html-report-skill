@@ -39,6 +39,8 @@ Read [references/codegraph-api.md](references/codegraph-api.md) when changing th
 - Prefer CodeGraph's module aggregation for architecture. Use file-pair fallback only when aggregation is unavailable, and state that fallback in the report.
 - Select entry candidates from executable file roots, routes/components, exported symbols, and conventional entry names. Use fan-in/fan-out only as ranking signals. Do not merge unrelated symbols just because they share a name.
 - Build each focused path separately and follow downstream `calls` edges. Do not mix callers and callees in the same primary diagram.
+- Render call-graph nodes with the original source symbol name (`node.name`). CodeGraph IDs, hashes, and synthetic names are internal lookup values and must never appear in diagrams, tables, headings, or explanatory text. If two visible nodes share a name, append their project-relative file path and one-based line number to disambiguate them.
+- Translate graph relationship kinds and selection reasons into plain reader-facing labels such as `calls`, `depends on`, `exported entry`, and `no indexed callers`. Keep module paths and source locations visible so a reader can move from the diagram to code.
 - Keep graph output bounded for reading: at most 8 architecture modules, 14 architecture links, 3 entry paths, 10 nodes and 14 edges per path, 12 evidence symbols, 20 source lines per excerpt, and 12 unresolved references. Preserve a visible warning when secondary relationships are folded out.
 - Show unresolved references and incomplete/partial index state in the report. Never invent a callee or silently drop an analysis warning.
 - Keep paths project-relative in the HTML, and include one-based line numbers for every embedded source snippet.
@@ -46,7 +48,7 @@ Read [references/codegraph-api.md](references/codegraph-api.md) when changing th
 
 ## Report writing
 
-Use Answer me with HTML's panel-oriented Markdown format: a short conclusion followed by panels for project summary, entry points, module architecture, focused call paths, source evidence, static impact, and limits. Keep the homepage concise. Use `flow` diagrams only for the compact architecture and key paths; do not add a full symbol inventory or full source dump. Every graph panel must state its scope, depth, and whether secondary relationships were folded out. The final panels must explain unresolved references, excluded files, and other limits.
+Use Answer me with HTML's panel-oriented Markdown format: a short conclusion followed by panels for project summary, entry points, module architecture, focused call paths, source evidence, static impact, and limits. Keep the homepage concise. Use `flow` diagrams only for the compact architecture and key paths; do not add a full symbol inventory or full source dump. Every graph panel must state its scope, depth, and whether secondary relationships were folded out. Hide panels that have no useful content, especially in overview scope, instead of showing empty tables. The final panels must explain unresolved references, excluded files, and other limits.
 
 ## Failure handling
 

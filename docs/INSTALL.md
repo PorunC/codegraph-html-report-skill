@@ -179,6 +179,8 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
 
 报告是自包含 HTML，可以直接打开：
 
+调用图节点保留源码中的函数名；遇到同名函数时会在节点后补充项目相对文件和起始行号，CodeGraph 的内部 ID 不会直接展示。
+
 ```bash
 # macOS
 open /path/to/project/.codewiki/reports/codegraph-report-<timestamp>.html
