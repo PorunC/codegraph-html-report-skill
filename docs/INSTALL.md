@@ -150,10 +150,10 @@ node skills/codegraph-html-report/scripts/generate_report.mjs \
 | --- | --- | --- |
 | `--project <path>` | 当前目录 | 指定要分析的项目目录 |
 | `--output <path>` | `.codewiki/reports/codegraph-report-<timestamp>.html` | 指定 HTML 文件路径 |
-| `--symbol <name>` | 自动选择 | 指定调用图焦点符号 |
-| `--depth <1-6>` | `2` | 设置调用图和影响范围深度 |
+| `--symbol <name>` | 自动选择 | 指定用于筛选入口的符号，报告仍按模块展示 |
+| `--depth <1-6>` | `2` | 设置内部调用关系和影响范围深度 |
 | `--scope full` | `full` | 生成完整报告 |
-| `--scope overview` | — | 只生成概览和目录结构 |
+| `--scope overview` | — | 只生成概览和目录结构，不展开调用关系 |
 | `--scope symbol` | — | 围绕 `--symbol` 生成报告 |
 | `--supplement <md>` | 无 | 加入额外架构说明 Markdown |
 | `--draft <path>` | 自动临时文件 | 保留 Markdown 草稿，便于调试格式 |
@@ -166,7 +166,7 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
   --symbol App.run \
   --depth 3 \
   --scope symbol \
-  --output ./my-project/docs/app-call-graph.html
+  --output ./my-project/docs/module-flow.html
 ```
 
 ## 查看结果
@@ -179,7 +179,7 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
 
 报告是自包含 HTML，可以直接打开：
 
-调用图节点保留源码中的函数名；遇到同名函数时会在节点后补充项目相对文件和起始行号，CodeGraph 的内部 ID 不会直接展示。
+报告以图为主：默认展示项目区域和模块关系，不输出具体函数、文件和行号清单；CodeGraph 的内部 ID 也不会直接展示。目录图会过滤测试、构建、生成和第三方目录，避免主结构被噪声淹没。
 
 ```bash
 # macOS
@@ -255,8 +255,7 @@ node "$REPORT_SKILL_DIR/scripts/generate_report.mjs" \
 
 - 分析范围是本地目录
 - 报告生成不上传源码
-- `.env`、SSH 私钥、`.pem` 和 `.key` 等识别到的敏感文件不会嵌入源码片段
-- 常见密钥、密码和令牌赋值会在片段中被替换为 `[REDACTED]`
+- 报告默认不嵌入源码片段、具体函数名或文件位置清单
 - 生成的 HTML 经过检查，不保留外部 `http(s)` 资源引用
 
-公开分享报告前，仍建议检查其中的项目路径、源码片段和业务名称。
+公开分享报告前，仍建议检查其中的项目名称、模块名称和业务名称。

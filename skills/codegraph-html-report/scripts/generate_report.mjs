@@ -18,9 +18,9 @@ const LIMITS = {
   paths: 3,
   pathNodes: 10,
   pathEdges: 14,
-  evidenceSymbols: 12,
-  snippetLines: 20,
   unresolved: 12,
+  impactModules: 8,
+  impactEdges: 14,
 };
 
 const CODE_KINDS = new Set(['function', 'method', 'class', 'route', 'component']);
@@ -39,8 +39,8 @@ function usage() {
 Options:
   --project <path>   Project directory (default: current directory)
   --output <path>    HTML output path (default: .codewiki/reports/...html)
-  --symbol <name>    Symbol to use as the call-graph focal point
-  --depth <number>   Call-graph traversal depth (default: ${DEFAULT_DEPTH})
+  --symbol <name>    Entry symbol used to focus analysis; report labels stay at module level
+  --depth <number>   Internal call traversal depth (default: ${DEFAULT_DEPTH})
   --scope <mode>     overview | full | symbol (default: full)
   --supplement <md>  Add architecture notes written from project source review
   --draft <path>     Keep the generated Markdown draft at this path
@@ -99,37 +99,12 @@ function escapeInline(value) {
   return String(value ?? '').replaceAll('`', '\\`');
 }
 
-function inlineCode(value) {
-  return `\`${escapeInline(value)}\``;
-}
-
-function safeCode(source) {
-  return String(source ?? '').replaceAll('```', "``\u200b`");
-}
-
-function redactSource(source) {
-  const assignment = /([A-Z0-9_.-]*(?:api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|password|passwd|secret|credential|private[_-]?key)[A-Z0-9_.-]*\s*[:=]\s*['"]?)[^\s,'";]+/i;
-  return String(source ?? '').split('\n').map((line) => line.replace(assignment, '$1[REDACTED]')).join('\n');
-}
-
-function isSensitivePath(filePath) {
-  return /(^|\/)(\.env(?:\.|$)|secrets?)(\/|$)|(^|\/)(id_rsa|id_ed25519)(\.|$)|\.(pem|key|p12|pfx)$/i.test(String(filePath));
-}
-
 function relativePath(root, filePath) {
-  const absolute = path.isAbsolute(filePath) ? filePath : path.join(root, filePath);
+  const value = String(filePath ?? '');
+  if (!value) return '';
+  const absolute = path.isAbsolute(value) ? value : path.join(root, value);
   const relative = path.relative(root, absolute);
-  return relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : filePath;
-}
-
-function lineRange(node) {
-  return `${node.startLine ?? '?'}-${node.endLine ?? node.startLine ?? '?'}`;
-}
-
-function languageFor(filePath, fallback = 'text') {
-  const ext = path.extname(filePath).slice(1).toLowerCase();
-  const map = { ts: 'typescript', tsx: 'tsx', js: 'javascript', jsx: 'jsx', py: 'python', go: 'go', rs: 'rust', java: 'java', cs: 'csharp', rb: 'ruby', php: 'php', swift: 'swift', kt: 'kotlin', c: 'c', h: 'c', cpp: 'cpp', cc: 'cpp', vue: 'vue', svelte: 'svelte' };
-  return map[ext] || fallback;
+  return relative && !relative.startsWith('..') && !path.isAbsolute(relative) ? relative : value;
 }
 
 function progressPrinter(progress) {
@@ -148,11 +123,6 @@ async function loadCodeGraph() {
   } catch (error) {
     throw new Error('CodeGraph is not installed. Run npm install in the codegraph-html-report skill directory before invoking it.', { cause: error });
   }
-}
-
-function nodeLabel(node) {
-  if (isCodeNode(node)) return sourceFunctionName(node);
-  return node?.name || node?.qualifiedName || 'unknown';
 }
 
 function normalizeFilePath(filePath) {
@@ -181,22 +151,6 @@ function sourceFunctionName(node) {
   return node?.kind === 'method' ? 'unnamed method' : 'unnamed function';
 }
 
-function entryReasonLabel(reason) {
-  const labels = {
-    'explicit symbol': 'requested symbol',
-    'explicit symbol search': 'requested symbol search',
-    'executable file root': 'top-level executable file',
-    'exported symbol': 'exported entry',
-    'indexed route': 'route entry',
-    'indexed component': 'component entry',
-    'conventional entry name': 'conventional entry name',
-    'fallback symbol search': 'name-search fallback',
-    'no incoming call edge': 'no indexed callers',
-    'has downstream calls': 'calls indexed functions',
-  };
-  return labels[reason] || reason;
-}
-
 function relationLabel(kinds) {
   const labels = {
     calls: 'calls',
@@ -209,10 +163,6 @@ function relationLabel(kinds) {
   };
   const values = [...new Set((kinds || []).filter(Boolean).map((kind) => labels[kind] || kind))];
   return values.join(' + ') || 'related modules';
-}
-
-function nodeLocation(root, node) {
-  return `${relativePath(root, node?.filePath)}:${node?.startLine ?? '?'}`;
 }
 
 function nodeModule(root, node) {
@@ -412,11 +362,32 @@ function collectFiles(graph, root) {
   const fileNodes = graph.getNodesByKind?.('file') || [];
   const paths = fileNodes.map((node) => relativePath(root, node.filePath || node.name)).filter(Boolean);
   const directories = new Map();
-  for (const filePath of paths) {
-    const top = filePath.split(path.sep)[0] || '.';
-    directories.set(top, (directories.get(top) || 0) + 1);
+  for (const filePath of paths.filter((item) => !isNoisePath(item))) {
+    const parts = normalizeFilePath(filePath).split('/').filter(Boolean).slice(0, -1);
+    for (let depth = 1; depth <= parts.length; depth += 1) {
+      const directory = parts.slice(0, depth).join('/');
+      directories.set(directory, (directories.get(directory) || 0) + 1);
+    }
   }
-  return { fileNodes, paths, directories };
+  const rankedDirectories = [...directories.entries()].sort((a, b) =>
+    (b[1] - a[1]) || (a[0].split('/').length - b[0].split('/').length) || a[0].localeCompare(b[0]));
+  const selectedDirectories = new Set();
+  for (const [directory] of rankedDirectories) {
+    const parts = directory.split('/');
+    const ancestors = parts.map((_, index) => parts.slice(0, index + 1).join('/'));
+    const missing = ancestors.filter((item) => !selectedDirectories.has(item));
+    if (selectedDirectories.size + missing.length > 24) continue;
+    for (const ancestor of ancestors) selectedDirectories.add(ancestor);
+  }
+  const visibleDirectories = [...selectedDirectories]
+    .map((directory) => [directory, directories.get(directory)])
+    .sort((a, b) => a[0].localeCompare(b[0]));
+  return {
+    fileNodes,
+    paths,
+    directories: visibleDirectories,
+    directoriesTruncated: selectedDirectories.size < directories.size,
+  };
 }
 
 function moduleName(filePath) {
@@ -436,6 +407,7 @@ function collectModuleDependencies(graph, root) {
     for (const pair of graph.getFileDependencyPairs?.() || []) {
       const fromFile = relativePath(root, pair.source);
       const toFile = relativePath(root, pair.target);
+      if (isNoisePath(fromFile) || isNoisePath(toFile)) continue;
       const from = moduleName(fromFile);
       const to = moduleName(toFile);
       if (from === to) continue;
@@ -456,7 +428,7 @@ function collectModuleDependencies(graph, root) {
 function moduleAssignments(graph, root) {
   return (graph.getNodesByKind?.('file') || [])
     .map((node) => ({ filePath: node.filePath, module: moduleName(relativePath(root, node.filePath)) }))
-    .filter((assignment) => assignment.filePath && assignment.module);
+    .filter((assignment) => assignment.filePath && assignment.module && !isNoisePath(assignment.filePath));
 }
 
 function collectArchitecture(graph, root) {
@@ -504,10 +476,10 @@ function collectArchitecture(graph, root) {
       current.uncertain = Math.max(current.uncertain || 0, link.uncertain || 0);
     }
   }
-  const rankedLinks = [...mergedLinks.values()]
+  const allRankedLinks = [...mergedLinks.values()]
     .filter((link) => link.source && link.target && link.source !== link.target)
-    .sort((a, b) => (b.declared - a.declared) || (b.count - a.count))
-    .slice(0, LIMITS.architectureEdges);
+    .sort((a, b) => (b.declared - a.declared) || (b.count - a.count));
+  const rankedLinks = allRankedLinks.slice(0, LIMITS.architectureEdges);
   const activeModules = new Set(rankedLinks.flatMap((link) => [link.source, link.target]));
   const rankedModules = [...modules.values()]
     .filter((module) => activeModules.has(module.name))
@@ -524,54 +496,16 @@ function collectArchitecture(graph, root) {
       return pair && visibleModules.has(link.source) && visibleModules.has(link.target) ? [pair] : [];
     }).slice(0, LIMITS.architectureEdges),
     fallback,
-  };
-}
-
-function serializeNode(root, node) {
-  return {
-    ...node,
-    filePath: relativePath(root, node.filePath),
-    shortName: sourceFunctionName(node),
-    location: nodeLocation(root, node),
-    module: nodeModule(root, node),
+    truncated: allRankedLinks.length > LIMITS.architectureEdges || activeModules.size > rankedModules.length,
   };
 }
 
 function serializePath(root, pathGraph) {
   return {
-    entry: serializeNode(root, pathGraph.entry),
-    nodes: pathGraph.nodes.map((node) => serializeNode(root, node)),
+    nodes: pathGraph.nodes.map((node) => ({ id: node.id, module: nodeModule(root, node) })),
     edges: pathGraph.edges,
     truncated: pathGraph.truncated,
   };
-}
-
-async function loadSymbolEvidence(graph, root, nodes) {
-  const unique = [...new Map(nodes.filter(isCodeNode).map((node) => [node.id, node])).values()]
-    .slice(0, LIMITS.evidenceSymbols);
-  const ids = unique.map((node) => node.id);
-  let fanIn = new Map();
-  let fanOut = new Map();
-  try {
-    fanIn = graph.getFanIn?.(ids) || new Map();
-    fanOut = graph.getFanOut?.(ids) || new Map();
-  } catch {
-    // Fan-in/out is optional evidence.
-  }
-  return Promise.all(unique.map(async (node) => {
-    let source = null;
-    try {
-      if (!isSensitivePath(node.filePath)) source = await graph.getCode?.(node.id);
-    } catch {
-      source = null;
-    }
-    return {
-      ...serializeNode(root, node),
-      fanIn: fanIn.get(node.id) || 0,
-      fanOut: fanOut.get(node.id) || 0,
-      source: source ? redactSource(source).split('\n').slice(0, LIMITS.snippetLines).join('\n') : null,
-    };
-  }));
 }
 
 async function buildSnapshot(graph, root, options) {
@@ -583,7 +517,20 @@ async function buildSnapshot(graph, root, options) {
     ? []
     : entrySelection.selected.map((entry) => buildKeyPath(graph, root, entry, options.depth));
   const pathNodes = pathGraphs.flatMap((pathGraph) => pathGraph.nodes);
-  const symbols = await loadSymbolEvidence(graph, root, pathNodes);
+  const moduleFlows = pathGraphs.flatMap((pathGraph) => {
+    const nodes = new Map(pathGraph.nodes.map((node) => [node.id, { id: node.id, module: nodeModule(root, node) }]));
+    const links = new Map();
+    for (const edge of pathGraph.edges.filter((item) => item.kind === 'calls')) {
+      const source = nodes.get(edge.source)?.module;
+      const target = nodes.get(edge.target)?.module;
+      if (!source || !target || source === target) continue;
+      const key = `${source}\u0000${target}`;
+      const item = links.get(key) || { source, target, count: 0 };
+      item.count += 1;
+      links.set(key, item);
+    }
+    return links.size ? [{ links: [...links.values()], truncated: pathGraph.truncated }] : [];
+  });
   const warnings = [];
   const state = graph.getIndexState?.();
   if (state && state !== 'complete') warnings.push(`CodeGraph index state: ${state}`);
@@ -592,46 +539,88 @@ async function buildSnapshot(graph, root, options) {
   if (pending) warnings.push(`${pending} references were still pending when the report was generated.`);
   if (entrySelection.ambiguous) warnings.push('The requested symbol matched multiple definitions; each selected definition has its own path.');
   if (!entrySelection.selected.length && options.scope !== 'overview') warnings.push('No high-confidence entry symbol was found; the report has no key call path.');
-  if (pathGraphs.some((pathGraph) => pathGraph.truncated)) warnings.push('Some secondary callees were folded out of the key paths to keep the diagrams readable.');
+  if (pathGraphs.some((pathGraph) => pathGraph.truncated)) warnings.push('Some secondary call relationships were folded out of the module flows to keep them readable.');
+  if (architecture.truncated) warnings.push('Some lower-ranked modules or relationships were folded out of the architecture diagram.');
   if (architecture.fallback) warnings.push('Module architecture uses a file-dependency fallback because this CodeGraph version has no module aggregation result.');
 
   const unresolved = [];
+  let unresolvedCapped = false;
   const unresolvedKeys = new Set();
   for (const node of pathNodes) {
     try {
       for (const ref of graph.getUnresolvedReferencesFrom?.(node.id) || []) {
         if (NOISE_REFERENCES.has(String(ref.referenceName || ''))) continue;
-        const filePath = relativePath(root, ref.filePath || node.filePath);
-        const item = { ...ref, filePath, owner: nodeLabel(node) };
-        const key = `${item.referenceName}|${item.referenceKind}|${filePath}|${item.line ?? ''}|${item.owner}`;
+        const item = {
+          module: nodeModule(root, node),
+          referenceName: String(ref.referenceName || 'unknown reference'),
+        };
+        const key = `${item.module}|${item.referenceName}`;
+        if (!unresolvedKeys.has(key) && unresolvedKeys.size >= LIMITS.unresolved) {
+          unresolvedCapped = true;
+          break;
+        }
         if (!unresolvedKeys.has(key)) {
           unresolvedKeys.add(key);
-          unresolved.push(item);
+          const current = unresolved.find((entry) => entry.module === item.module);
+          if (current) current.count += 1;
+          else unresolved.push({ module: item.module, count: 1 });
         }
-        if (unresolved.length >= LIMITS.unresolved) break;
       }
     } catch {
       // An older index may not expose unresolved-reference rows.
     }
-    if (unresolved.length >= LIMITS.unresolved) break;
+    if (unresolvedCapped) break;
   }
 
-  let impact = { focal: null, nodes: [] };
+  let impact = { focalModule: null, modules: [], edges: [], truncated: false };
   const focal = entrySelection.selected[0]?.node;
   if (focal && options.scope !== 'overview') {
     try {
       const subgraph = graph.getImpactRadius(focal.id, options.depth);
+      const impactedNodes = [...(subgraph.nodes?.values?.() || [])]
+        .filter((node) => node.id !== focal.id && isCodeNode(node) && !isNoisePath(node.filePath));
+      const countsByModule = new Map();
+      for (const node of impactedNodes) {
+        const module = nodeModule(root, node);
+        if (module !== nodeModule(root, focal)) countsByModule.set(module, (countsByModule.get(module) || 0) + 1);
+      }
+      const selectedModules = new Set([...countsByModule]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, LIMITS.impactModules)
+        .map(([module]) => module));
+      const moduleById = new Map([[focal.id, nodeModule(root, focal)]]);
+      for (const node of impactedNodes) moduleById.set(node.id, nodeModule(root, node));
+      const impactLinks = new Map();
+      for (const edge of subgraph.edges || []) {
+        if (!['calls', 'imports'].includes(edge.kind)) continue;
+        const source = moduleById.get(edge.source);
+        const target = moduleById.get(edge.target);
+        if (!source || !target || source === target || (source !== nodeModule(root, focal) && !selectedModules.has(source)) || (target !== nodeModule(root, focal) && !selectedModules.has(target))) continue;
+        const kind = edge.kind === 'imports' ? 'depends on' : 'calls';
+        const key = `${source}\u0000${target}\u0000${kind}`;
+        const current = impactLinks.get(key) || { source, target, kind, count: 0 };
+        current.count += 1;
+        impactLinks.set(key, current);
+      }
+      if (!impactLinks.size) {
+        for (const module of selectedModules) {
+          impactLinks.set(`${nodeModule(root, focal)}\u0000${module}`, {
+            source: nodeModule(root, focal), target: module, kind: 'may affect', count: 1,
+          });
+        }
+      }
       impact = {
-        focal: serializeNode(root, focal),
-        nodes: [...(subgraph.nodes?.values?.() || [])]
-          .filter((node) => node.id !== focal.id && isCodeNode(node) && !isNoisePath(node.filePath))
-          .slice(0, 8)
-          .map((node) => serializeNode(root, node)),
+        focalModule: nodeModule(root, focal),
+        modules: [...selectedModules],
+        depth: options.depth,
+        edges: [...impactLinks.values()].slice(0, LIMITS.impactEdges),
+        truncated: countsByModule.size > LIMITS.impactModules || impactLinks.size > LIMITS.impactEdges,
       };
     } catch {
       warnings.push('Impact radius could not be queried for the primary entry symbol.');
     }
   }
+  if (impact.truncated) warnings.push('Some lower-ranked modules or relationships were folded out of the impact diagram.');
 
   return {
     schemaVersion: 2,
@@ -644,41 +633,18 @@ async function buildSnapshot(graph, root, options) {
       frameworks: graph.getDetectedFrameworks?.() || [],
     },
     stats,
-    directories: [...files.directories.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12),
+    directories: files.directories,
+    directoriesTruncated: files.directoriesTruncated,
     fileCount: stats.fileCount ?? files.paths.length,
     architecture,
-    entries: entrySelection.selected.map((entry) => ({
-      ...serializeNode(root, entry.node),
-      score: Math.round(entry.score * 10) / 10,
-      reasons: entry.reasons,
-      fanIn: entry.fanIn,
-      fanOut: entry.fanOut,
-    })),
+    entries: entrySelection.selected.map((entry) => ({ module: nodeModule(root, entry.node) })),
     paths: pathGraphs.map((pathGraph) => serializePath(root, pathGraph)),
-    symbols,
+    moduleFlows,
     impact,
     unresolved,
+    unresolvedCapped,
     warnings,
   };
-}
-
-function displayLabels(nodes) {
-  const counts = new Map();
-  for (const node of nodes) counts.set(node.shortName, (counts.get(node.shortName) || 0) + 1);
-  const used = new Set();
-  const occurrences = new Map();
-  const labels = new Map();
-  for (const node of nodes) {
-    const base = node.shortName || 'unknown';
-    const location = `${node.filePath}:${node.startLine ?? '?'}`;
-    const occurrence = (occurrences.get(base) || 0) + 1;
-    occurrences.set(base, occurrence);
-    let label = counts.get(base) > 1 ? `${base} · ${location}` : base;
-    if (used.has(label)) label = `${base} · ${location} (${occurrence})`;
-    used.add(label);
-    labels.set(node.id, label);
-  }
-  return labels;
 }
 
 function flowToken(label) {
@@ -700,121 +666,126 @@ function architectureMarkdown(snapshot) {
       lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: ${relationLabel(link.kinds || [link.kind])}${evidence}`);
     }
   }
-  lines.push('```', '', '| Module | Indexed files |', '| --- | ---: |');
-  for (const module of modules) lines.push(`| ${escapeCell(module.name)} | ${module.files} |`);
-  lines.push('', snapshot.architecture.fallback
+  lines.push('```', '', `The diagram keeps ${modules.length} high-confidence modules and ${links.length} relationships.`);
+  lines.push(snapshot.architecture.fallback
     ? 'Edges use the file-dependency fallback. The module aggregation API did not return a usable result.'
     : 'This diagram keeps direct module relationships supported by the index and leaves weaker matches out.');
+  if (snapshot.architecture.truncated) lines.push('Some lower-ranked modules or links are omitted.');
   return lines.join('\n');
 }
 
-function pathMarkdown(pathGraph, index) {
-  const nodes = pathGraph.nodes;
-  const edges = pathGraph.edges.filter((edge) => edge.kind === 'calls');
-  const title = `${pathGraph.entry.shortName} · ${pathGraph.entry.location}`;
-  if (!edges.length) return `### Main path ${index + 1}: ${inlineCode(title)}\n\n_No resolved downstream calls were found for this entry._`;
-  const labels = displayLabels(nodes);
-  const lines = [`### Main path ${index + 1}: ${inlineCode(title)}`, '', '```flow LR'];
+function projectAreasMarkdown(snapshot) {
+  if (!snapshot.directories.length) return '';
+  const lines = ['## Project areas {span=2}', '', '```tree list', `${snapshot.project.name} | indexed source areas`];
+  for (const [directory, count] of snapshot.directories) {
+    const depth = directory.split('/').length;
+    const name = directory.split('/').at(-1);
+    lines.push(`${'  '.repeat(depth)}${name}/ | ${count} indexed file${count === 1 ? '' : 's'}`);
+  }
+  lines.push('```', '', 'This hierarchy groups files by directory; it does not enumerate individual files.');
+  if (snapshot.directoriesTruncated) lines.push('Some lower-ranked folders are omitted from this view.');
+  return lines.join('\n');
+}
+
+function entrySurfacesMarkdown(snapshot) {
+  if (!snapshot.entries.length) return '';
+  const modules = new Map();
+  for (const entry of snapshot.entries) modules.set(entry.module, (modules.get(entry.module) || 0) + 1);
+  const lines = [
+    '## Entry areas {span=2}',
+    '',
+    'Selected starting points are grouped by module; no individual symbols are listed.',
+    '',
+    '```flow LR',
+  ];
+  for (const [module, count] of modules) {
+    lines.push(`${flowToken('selected starts')} -> ${flowToken(module)}: ${count} selected start${count === 1 ? '' : 's'}`);
+  }
+  lines.push('```');
+  return lines.join('\n');
+}
+
+function moduleFlowMarkdown(snapshot, options) {
+  const paths = snapshot.moduleFlows;
+  if (!paths.length) return '';
+  const lines = [
+    '## Selected module flows {span=2}',
+    '',
+    `Scope: ${options.scope} · downstream depth: ${options.depth} · each flow keeps at most ${LIMITS.pathNodes} internal nodes and ${LIMITS.pathEdges} calls before grouping by module. Only calls crossing module boundaries are drawn.`,
+  ];
+  paths.forEach(({ links, truncated }, index) => {
+    lines.push('', `### Module flow ${index + 1}`, '', '```flow LR');
+    for (const link of links) lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: calls${link.count > 1 ? ` · ${link.count} links` : ''}`);
+    lines.push('```');
+    if (truncated) lines.push('', '_Some secondary call relationships were folded out._');
+  });
+  return lines.join('\n');
+}
+
+function impactMarkdown(snapshot) {
+  const { focalModule, modules, edges, depth, truncated } = snapshot.impact;
+  if (!focalModule || !modules.length || !edges.length) return '';
+  const lines = [
+    '## Static impact by module {span=2}',
+    '',
+    `The selected area has indexed relationships to up to ${modules.length} other project area${modules.length === 1 ? '' : 's'} within depth ${depth}.`,
+    '',
+    '```flow LR',
+  ];
   for (const edge of edges) {
-    const source = labels.get(edge.source);
-    const target = labels.get(edge.target);
-    if (source && target) lines.push(`${flowToken(source)} -> ${flowToken(target)}: calls${edge.line ? ` · line ${edge.line}` : ''}`);
+    const source = edge.source === focalModule ? `selected · ${focalModule}` : edge.source;
+    if (source && edge.target) lines.push(`${flowToken(source)} -> ${flowToken(edge.target)}: ${edge.kind}${edge.count > 1 ? ` · ${edge.count} links` : ''}`);
   }
-  lines.push('```', '', '| Function | Module | Location |', '| --- | --- | --- |');
-  for (const node of nodes) {
-    const label = labels.get(node.id);
-    if (label) lines.push(`| ${escapeCell(label)} | ${escapeCell(node.module)} | ${escapeCell(node.location)} |`);
-  }
-  if (pathGraph.truncated) lines.push('', '_Secondary callees were folded out to keep this path readable._');
+  lines.push('```');
+  if (truncated) lines.push('', '_Some lower-ranked modules or relationships were folded out._');
   return lines.join('\n');
 }
 
-function sourceBlocks(snapshot) {
-  const blocks = [];
-  const seen = new Set();
-  const labels = displayLabels(snapshot.symbols);
-  for (const symbol of snapshot.symbols) {
-    if (!symbol.source || seen.has(symbol.id)) continue;
-    seen.add(symbol.id);
-    const language = languageFor(symbol.filePath);
-    blocks.push(
-      `### ${escapeInline(symbol.module)} · ${escapeInline(labels.get(symbol.id) || symbol.shortName)}\n\n\`${symbol.kind}\` · \`${escapeInline(symbol.location)}\`\n\n\`\`\`${language} title="${escapeInline(symbol.location)}"\n${safeCode(symbol.source)}\n\`\`\``,
-    );
+function unresolvedMarkdown(snapshot) {
+  if (!snapshot.unresolved.length) return '';
+  const lines = [
+    '## Unresolved boundaries {span=2}',
+    '',
+    `The selected paths have ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} unresolved references across ${snapshot.unresolved.length} project area${snapshot.unresolved.length === 1 ? '' : 's'}. Individual names and source locations are omitted.`,
+    '',
+    '```flow LR',
+  ];
+  for (const ref of snapshot.unresolved) {
+    lines.push(`${flowToken(ref.module)} -> ${flowToken('unresolved references')}: ${ref.count} unresolved reference${ref.count === 1 ? '' : 's'}`);
   }
-  return blocks.join('\n\n') || '_No source excerpt was needed for the selected paths._';
+  lines.push('```');
+  if (snapshot.unresolvedCapped) lines.push('', `_Only the first ${LIMITS.unresolved} unresolved references are shown._`);
+  return lines.join('\n');
 }
 
 function reportMarkdown(snapshot, options) {
   const languages = Object.entries(snapshot.stats.filesByLanguage || {}).filter(([, count]) => count).sort((a, b) => b[1] - a[1]);
-  const entryRows = snapshot.entries.map((entry) => `| ${escapeCell(entry.module)} · ${escapeCell(entry.shortName)} | ${escapeCell(entry.location)} | ${escapeCell([...new Set(entry.reasons.map(entryReasonLabel))].join(', '))} |`).join('\n');
-  const impactRows = snapshot.impact.nodes.length
-    ? snapshot.impact.nodes.map((node) => `| ${escapeCell(node.module)} · ${escapeCell(node.shortName)} | ${escapeCell(node.location)} |`).join('\n')
-    : '| _(no additional static impact nodes returned)_ | |';
-  const unresolvedRows = snapshot.unresolved.length
-    ? snapshot.unresolved.map((ref) => `| ${escapeCell(ref.referenceName)} | ${escapeCell(ref.filePath)}:${ref.line ?? '?'} | ${escapeCell(ref.owner)} |`).join('\n')
-    : '| _(none sampled from the selected paths)_ | | |';
   const warningRows = snapshot.warnings.length ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n') : '- The index is complete. No material warnings were reported.';
   const languagesText = languages.map(([language, count]) => `${language} (${count})`).join(', ') || 'not reported';
   const supplement = options.supplement ? fs.readFileSync(path.resolve(options.supplement), 'utf8') : '';
-  const entrySummary = snapshot.entries.length === 1 ? '1 entry candidate' : `${snapshot.entries.length} entry candidates`;
-  const pathSummary = snapshot.paths.length === 1 ? '1 focused path' : `${snapshot.paths.length} focused paths`;
   const scopeSummary = options.scope === 'overview'
-    ? 'Overview scope keeps the report to project structure; call paths and source excerpts are intentionally omitted.'
+    ? 'Overview scope keeps the report to project structure; call paths and boundary diagrams are intentionally omitted.'
     : snapshot.entries.length
-      ? `The analysis selected **${entrySummary}** and **${pathSummary}**. The diagrams show static call evidence, not a runtime trace.`
-      : 'No high-confidence entry was found automatically. Pass `--symbol <name>` to focus the report.';
+      ? `Selected **${snapshot.entries.length} starting area${snapshot.entries.length === 1 ? '' : 's'}** and found **${snapshot.moduleFlows.length} cross-module flow${snapshot.moduleFlows.length === 1 ? '' : 's'}**. Read the diagrams from left to right; they show static relationships, not a runtime trace.`
+      : 'No clear starting area was found automatically. Pass `--symbol <name>` to focus the report.';
   const unresolvedSummary = options.scope === 'overview'
     ? '- Unresolved references are not sampled in overview scope.'
     : snapshot.unresolved.length
-      ? `- ${snapshot.unresolved.length} unresolved reference(s) were found in the selected paths; see the final panel.`
+      ? `- ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} unresolved reference(s) are grouped in the unresolved-boundary diagram.`
       : '- No unresolved references were found in the selected paths.';
-  const pathSection = options.scope === 'overview' ? '' : `
-## Key call paths {span=2}
-
-Focus: ${inlineCode(options.scope)} · downstream depth: ${inlineCode(options.depth)} · each path keeps at most ${LIMITS.pathNodes} functions and ${LIMITS.pathEdges} calls.
-
-${snapshot.paths.map((pathGraph, index) => pathMarkdown(pathGraph, index)).join('\n\n') || '_No downstream call path was resolved._'}
-`;
-  const sourceSection = snapshot.symbols.some((symbol) => symbol.source) ? `
-## Focused source evidence
-
-Only symbols used by the selected paths are shown. Each excerpt is limited to ${LIMITS.snippetLines} lines.
-
-${sourceBlocks(snapshot)}
-` : '';
-  const impactSection = snapshot.impact.focal && snapshot.impact.nodes.length ? `
-## Change impact
-
-Changing ${inlineCode(snapshot.impact.focal.shortName)} at ${inlineCode(snapshot.impact.focal.location)} may affect these indexed symbols at depth ${options.depth}.
-
-| Related symbol | Location |
-| --- | --- |
-${impactRows}
-` : '';
-  const unresolvedSection = snapshot.unresolved.length ? `
-## Unresolved references
-
-Only unresolved references attached to selected path symbols are shown, capped at ${LIMITS.unresolved} rows.
-
-| Reference | Location | Referencing symbol |
-| --- | --- | --- |
-${unresolvedRows}
-` : '';
-  const entrySection = snapshot.entries.length ? `
-## Entry points
-
-| Candidate | Location | Why selected |
-| --- | --- | --- |
-${entryRows}
-` : '';
+  const areasSection = projectAreasMarkdown(snapshot);
+  const entrySection = entrySurfacesMarkdown(snapshot);
+  const moduleFlowSection = options.scope === 'overview' ? '' : moduleFlowMarkdown(snapshot, options);
+  const impactSection = options.scope === 'overview' ? '' : impactMarkdown(snapshot);
+  const unresolvedSection = options.scope === 'overview' ? '' : unresolvedMarkdown(snapshot);
   return `---
 template: sheet
 theme: auto
 title: ${quoteYaml(`${snapshot.project.name} · CodeGraph architecture report`)}
-subtitle: ${quoteYaml(`Focused static analysis · ${snapshot.project.analyzedAt}`)}
+subtitle: ${quoteYaml(`Diagram-first static analysis · ${snapshot.project.analyzedAt}`)}
 cols: 2
 ---
-This report explains the most important structure found in **${escapeInline(snapshot.project.name)}**. CodeGraph supplies static relationship evidence; the report keeps only high-confidence modules, entries, and downstream paths.
+This report is a diagram-first view of **${escapeInline(snapshot.project.name)}**. CodeGraph supplies static relationship evidence; the report keeps project areas, module links, cross-module flows, impact, and unresolved boundaries at architecture level.
 
 ## Project at a glance {span=2}
 
@@ -824,31 +795,31 @@ This report explains the most important structure found in **${escapeInline(snap
 
 ${scopeSummary}
 
+${areasSection}
+
 ${entrySection}
 
 ## Module architecture {span=2}
 
 ${architectureMarkdown(snapshot)}
 
-${pathSection}
-
-${sourceSection}
+${moduleFlowSection}
 
 ${supplement}
 
 ${impactSection}
+
+${unresolvedSection}
 
 ## Reliability and limits
 
 ${warningRows}
 
 - Dynamic dispatch, reflection, generated code, and external package internals may remain unresolved.
-- Test, vendor, generated, and build paths are excluded from entry selection and path diagrams by default.
-- Obvious language-runtime references such as Boolean or Promise are omitted from the unresolved-reference table.
+- Test, fixture, documentation, vendor, generated, mock, and build paths are excluded from entry selection and project-area diagrams by default.
+- Obvious language-runtime references such as Boolean or Promise are omitted from the unresolved-boundary diagram.
 - Module edges are aggregated evidence. A static edge does not prove that a path executes at runtime.
 ${unresolvedSummary}
-
-${unresolvedSection}
 `;
 }
 

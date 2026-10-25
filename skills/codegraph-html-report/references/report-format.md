@@ -19,18 +19,18 @@ cols: 3
 Short statement of what the report covers.
 
 ## Overview
-Tables and a concise interpretation.
+A short statistics table and a concise interpretation.
 
-## Call graph
+## Module flow
 ```flow LR
-A -> B: calls
+src/api -> src/core: calls
 ```
 
-## Key symbols
-Use source-relative paths and one-based line numbers.
+## Diagram panels
+Prefer project/module diagrams over function or location inventory tables. The default report keeps individual function names, file paths, and line numbers out of the report body.
 
 ## Limitations
 Explain unresolved edges, excluded files, and truncation.
 ```
 
-Do not put remote URLs in HTML blocks or Markdown image references. Keep code snippets short and escape table cells containing `|` or newlines.
+Do not put remote URLs in HTML blocks or Markdown image references. Avoid source snippets and location lists; escape table cells containing `|` or newlines.

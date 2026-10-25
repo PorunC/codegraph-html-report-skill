@@ -32,6 +32,6 @@ Useful node fields are `id`, `kind`, `name`, `qualifiedName`, `filePath`, `langu
 
 `getStats()` returns `fileCount`, `nodeCount`, `edgeCount`, `nodesByKind`, `edgesByKind`, `filesByLanguage`, and index timestamps. `getCallers()` and `getCallees()` return `{ node, edge }` pairs. `getImpactRadius()` returns a `Subgraph` with `nodes`, `edges`, and `roots`.
 
-For a readable architecture diagram, assign each indexed file to a project-relative module name and use `getModuleAggregation()`. Its `links` roll up graph relationships to module pairs; `declared` counts relationships supported by explicit source syntax, while `uncertain` identifies lower-confidence resolution. Use `pairs` to retain a small amount of symbol-level evidence behind a module link. Do not treat a static link as proof of runtime execution.
+For a readable architecture diagram, assign each indexed file to a project-relative module name and use `getModuleAggregation()`. Its `links` roll up graph relationships to module pairs; `declared` counts relationships supported by explicit source syntax, while `uncertain` identifies lower-confidence resolution. Keep pair-level evidence internal; the report should only show module labels and aggregate relationships. Do not treat a static link as proof of runtime execution.
 
 The generator should cap all traversal results before writing Markdown. A cap is a presentation limit, not evidence that the graph contains no further relationships.
