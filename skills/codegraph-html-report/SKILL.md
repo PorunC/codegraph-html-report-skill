@@ -39,14 +39,25 @@ Read [references/codegraph-api.md](references/codegraph-api.md) when changing th
 - Build each focused path separately and follow downstream `calls` edges. Keep both a module-level aggregation for architecture pages and a bounded function-level representation for `call-flows.html`.
 - Keep CodeGraph IDs, hashes, synthetic names, source locations, and function/location inventory tables out of the overview, architecture, and details pages. The key call-flow diagrams may show source function names, prefixed by their module; keep names on diagram nodes instead of repeating them in explanatory prose or a function inventory.
 - Translate graph relationship kinds into plain Chinese reader-facing labels and explain what arrows and branches mean. Avoid source dumps and file/location lists.
-- Keep graph output bounded for reading: at most 8 architecture modules, 14 architecture links, 3 entry paths, 10 internal nodes and 14 edges per path, 8 impact modules, 14 impact links, and 12 unresolved references. Preserve a visible warning when secondary relationships are folded out.
+- Keep graph output bounded for reading: at most 8 architecture modules, 14 architecture links, 3 entry paths, 2 downstream targets per call node, 10 nodes and 14 edges per path, 8 impact modules, 14 impact links, and 12 unresolved-reference names. Preserve a visible warning when secondary relationships are folded out.
 - Show unresolved references and incomplete/partial index state in the report. Never invent a callee or silently drop an analysis warning.
 - Keep the report at project/module level outside the function-flow diagrams; do not expand individual file paths or line numbers into lists.
 - Embed all page data, CSS, SVG, and JavaScript in each output file. Page navigation must use relative links and work when `index.html` is opened with `file://` after the command exits.
 
 ## Report writing
 
-Use Answer me with HTML's panel-oriented Markdown format for four linked pages. Keep the overview concise. Use diagrams for project areas, entry areas, module architecture, cross-module flows, key function calls, impact, and unresolved boundaries. The function-flow page should retain a small set of source function names on diagram nodes, prefix them with a module label, and include concise Chinese guidance about arrows, branches, depth, and static-analysis limits. Avoid repeating individual names in prose. Do not add file/location inventory tables or source dumps. Hide empty diagrams and explain when lower-ranked relationships were folded out. The details page must explain unresolved references, excluded files, and other limits.
+Write each page for a reader who has not seen the source index. Lead with the page's conclusion or purpose, then organize material in the order the reader needs it.
+
+- Keep the overview short. State the analysis scope and main conclusion first, show a compact architecture preview, and link to the page that answers each next question.
+- Organize architecture as project areas, module relationships, candidate entry areas or cross-module paths, then a short reading guide. Explain arrows beside the diagram.
+- Introduce each call-flow diagram as a structurally selected candidate path. Static entry selection does not establish the user's trigger or business purpose. Split long diagrams into static call-depth layers using only the original nodes and edges; a real node may appear in adjacent diagrams as a boundary. Layer numbers do not imply runtime phases. Never add a synthetic continuation node or relation.
+- Explain that multiple outgoing edges identify multiple static targets, not proven conditional branches or execution order. State when normal outputs, return values, exception paths, or recovery behavior cannot be confirmed. A leaf in a bounded graph is not a confirmed business endpoint.
+- Place impact, unresolved-reference, index-state, exclusion, and folding explanations next to the relevant diagram or in the details page. Distinguish analysis/index warnings from visual folding notices.
+- Select `sheet` for compact parallel summaries and `doc` for content that needs sequential reading. Keep the choice deterministic and omit `cols` from `doc` frontmatter.
+- Use diagrams for project areas, module relationships, candidate entry areas, cross-module paths, key function calls, impact, and unresolved boundaries. Keep function names only on key call-flow diagram nodes, prefixed with their module. Do not repeat them in prose or add function, file, or location inventories.
+- Hide empty diagrams and state why they are absent. Keep folded relationship notices visible; never shrink or overfill a diagram to imply completeness.
+
+Do not infer a business result, exception path, or runtime ordering from a static graph. When the available snapshot cannot support a statement, say “无法确认” or “未识别到” and explain the scope that was checked. Read [references/report-format.md](references/report-format.md) when editing page structure, layout rules, or diagrams.
 
 ## Failure handling
 

@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { layoutFrontmatter, selectPageLayout, splitCallPathIntoStages } from './report-layout.mjs';
 
 const DEFAULT_DEPTH = 2;
 const LIMITS = {
@@ -18,6 +19,7 @@ const LIMITS = {
   paths: 3,
   pathNodes: 10,
   pathEdges: 14,
+  callsPerNode: 2,
   unresolved: 12,
   impactModules: 8,
   impactEdges: 14,
@@ -321,16 +323,18 @@ function relationshipScore(relationship, source, target, root, fanOut) {
 
 function buildKeyPath(graph, root, entry, depth) {
   const nodes = new Map([[entry.node.id, entry.node]]);
+  const levels = new Map([[entry.node.id, 0]]);
   const edges = [];
   const queue = [{ node: entry.node, level: 0 }];
   const visited = new Set([entry.node.id]);
-  let truncated = false;
+  let folded = false;
+  let queryFailed = false;
   const fanOutCache = new Map();
   while (queue.length) {
     const { node, level } = queue.shift();
     if (level >= depth) continue;
     let relationships = [];
-    try { relationships = graph.getCallees?.(node.id, 1) || []; } catch { truncated = true; continue; }
+    try { relationships = graph.getCallees?.(node.id, 1) || []; } catch { queryFailed = true; continue; }
     const targetIds = relationships.map((relationship) => relationship?.node?.id).filter(Boolean);
     let fanOut = new Map();
     try { fanOut = graph.getFanOut?.(targetIds) || new Map(); } catch { /* optional */ }
@@ -340,18 +344,23 @@ function buildKeyPath(graph, root, entry, depth) {
       .map((relationship) => ({ ...relationship, score: relationshipScore(relationship, node, relationship.node, root, fanOutCache) }))
       .filter((relationship) => relationship.score > -100)
       .sort((a, b) => b.score - a.score);
-    if (ranked.length > 2) truncated = true;
-    for (const relationship of ranked.slice(0, 2)) {
-      if (edges.length >= 14 || nodes.size >= 10) { truncated = true; break; }
+    if (ranked.length > LIMITS.callsPerNode) folded = true;
+    for (const relationship of ranked.slice(0, LIMITS.callsPerNode)) {
       const target = relationship.node;
-      if (visited.has(target.id)) continue;
+      if (visited.has(target.id)) {
+        if (edges.length >= LIMITS.pathEdges) { folded = true; break; }
+        edges.push(relationship.edge);
+        continue;
+      }
+      if (edges.length >= LIMITS.pathEdges || nodes.size >= LIMITS.pathNodes) { folded = true; break; }
       visited.add(target.id);
       nodes.set(target.id, target);
+      levels.set(target.id, level + 1);
       edges.push(relationship.edge);
       if (level + 1 < depth) queue.push({ node: target, level: level + 1 });
     }
   }
-  return { entry: entry.node, nodes: [...nodes.values()], edges, truncated };
+  return { entry: entry.node, nodes: [...nodes.values()], edges, levels, folded, queryFailed, truncated: folded || queryFailed };
 }
 
 function collectFiles(graph, root) {
@@ -507,9 +516,14 @@ function serializeCodeNode(root, node) {
 function serializePath(root, pathGraph) {
   return {
     entry: serializeCodeNode(root, pathGraph.entry),
-    nodes: pathGraph.nodes.map((node) => serializeCodeNode(root, node)),
+    nodes: pathGraph.nodes.map((node) => ({
+      ...serializeCodeNode(root, node),
+      level: pathGraph.levels?.get(node.id) ?? 0,
+    })),
     edges: pathGraph.edges.map(({ source, target, kind }) => ({ source, target, kind })),
     truncated: pathGraph.truncated,
+    folded: pathGraph.folded,
+    queryFailed: pathGraph.queryFailed,
   };
 }
 
@@ -534,52 +548,72 @@ async function buildSnapshot(graph, root, options) {
       item.count += 1;
       links.set(key, item);
     }
-    return links.size ? [{ links: [...links.values()], truncated: pathGraph.truncated }] : [];
+    return links.size ? [{
+      links: [...links.values()],
+      folded: pathGraph.folded,
+      queryFailed: pathGraph.queryFailed,
+    }] : [];
   });
   const warnings = [];
+  const analysisWarnings = [];
+  const presentationWarnings = [];
+  const addWarning = (message, category = 'analysis') => {
+    warnings.push(message);
+    (category === 'presentation' ? presentationWarnings : analysisWarnings).push(message);
+  };
   const state = graph.getIndexState?.();
-  if (state && state !== 'complete') warnings.push(`CodeGraph 索引状态：${state}`);
-  if (graph.isIndexStale?.()) warnings.push('当前索引由较旧的提取版本生成。');
+  if (state && state !== 'complete') addWarning(`CodeGraph 索引状态：${state}`);
+  if (graph.isIndexStale?.()) addWarning('当前索引由较旧的提取版本生成。');
   const pending = graph.getPendingReferenceCount?.() || 0;
-  if (pending) warnings.push(`生成报告时仍有 ${pending} 条引用待解析。`);
-  if (entrySelection.ambiguous) warnings.push('入口筛选匹配到多个定义，已分别分析各自的调用流程。');
-  if (!entrySelection.selected.length && options.scope !== 'overview') warnings.push('未识别到可信入口，因此没有生成关键调用流程图。');
-  if (pathGraphs.some((pathGraph) => pathGraph.truncated)) warnings.push('部分次要调用分支已折叠，以控制流程图大小。');
-  if (architecture.truncated) warnings.push('架构图折叠了部分低优先级模块或关系。');
-  if (architecture.fallback) warnings.push('当前 CodeGraph 没有可用的模块聚合结果，架构图改用文件依赖关系汇总。');
+  if (pending) addWarning(`生成报告时仍有 ${pending} 条引用待解析。`);
+  if (entrySelection.ambiguous) addWarning('入口筛选匹配到多个定义，已分别分析各自的调用流程。');
+  if (!entrySelection.selected.length && options.scope !== 'overview') addWarning('未识别到可信入口，因此没有生成关键调用流程图。');
+  if (pathGraphs.some((pathGraph) => pathGraph.folded)) addWarning('部分低优先级调用关系因图表上限已折叠。', 'presentation');
+  if (pathGraphs.some((pathGraph) => pathGraph.queryFailed)) addWarning('部分入口的下游调用查询失败，相关流程图不完整。');
+  if (architecture.truncated) addWarning('架构图折叠了部分低优先级模块或关系。', 'presentation');
+  if (files.directoriesTruncated) addWarning('项目区域树折叠了部分低优先级目录。', 'presentation');
+  if (architecture.fallback) addWarning('当前 CodeGraph 没有可用的模块聚合结果，架构图改用文件依赖关系汇总。');
 
   const unresolved = [];
   let unresolvedCapped = false;
+  let unresolvedStatus = options.scope === 'overview' ? 'not-requested' : pathNodes.length ? 'unsupported' : 'no-path';
   const unresolvedKeys = new Set();
-  for (const node of pathNodes) {
-    try {
-      for (const ref of graph.getUnresolvedReferencesFrom?.(node.id) || []) {
-        if (NOISE_REFERENCES.has(String(ref.referenceName || ''))) continue;
-        const item = {
-          module: nodeModule(root, node),
-          referenceName: String(ref.referenceName || 'unknown reference'),
-        };
-        const key = `${item.module}|${item.referenceName}`;
-        if (!unresolvedKeys.has(key) && unresolvedKeys.size >= LIMITS.unresolved) {
-          unresolvedCapped = true;
-          break;
+  if (pathNodes.length && typeof graph.getUnresolvedReferencesFrom === 'function') {
+    unresolvedStatus = 'complete';
+    for (const node of pathNodes) {
+      try {
+        for (const ref of graph.getUnresolvedReferencesFrom(node.id) || []) {
+          if (NOISE_REFERENCES.has(String(ref.referenceName || ''))) continue;
+          const item = {
+            module: nodeModule(root, node),
+            referenceName: String(ref.referenceName || 'unknown reference'),
+          };
+          const key = `${item.module}|${item.referenceName}`;
+          if (!unresolvedKeys.has(key) && unresolvedKeys.size >= LIMITS.unresolved) {
+            unresolvedCapped = true;
+            break;
+          }
+          if (!unresolvedKeys.has(key)) {
+            unresolvedKeys.add(key);
+            const current = unresolved.find((entry) => entry.module === item.module);
+            if (current) current.count += 1;
+            else unresolved.push({ module: item.module, count: 1 });
+          }
         }
-        if (!unresolvedKeys.has(key)) {
-          unresolvedKeys.add(key);
-          const current = unresolved.find((entry) => entry.module === item.module);
-          if (current) current.count += 1;
-          else unresolved.push({ module: item.module, count: 1 });
-        }
+      } catch {
+        unresolvedStatus = 'partial';
       }
-    } catch {
-      // An older index may not expose unresolved-reference rows.
+      if (unresolvedCapped) break;
     }
-    if (unresolvedCapped) break;
   }
+  if (unresolvedStatus === 'unsupported') addWarning('当前 CodeGraph 接口未提供未解析引用查询，本报告无法确认这部分边界。');
+  if (unresolvedStatus === 'partial') addWarning('部分未解析引用查询失败，图表只包含成功查询到的结果。');
 
   let impact = { focalModule: null, modules: [], edges: [], truncated: false };
+  let impactStatus = options.scope === 'overview' ? 'not-requested' : 'no-entry';
   const focal = entrySelection.selected[0]?.node;
   if (focal && options.scope !== 'overview') {
+    impactStatus = 'query-failed';
     try {
       const subgraph = graph.getImpactRadius(focal.id, options.depth);
       const impactedNodes = [...(subgraph.nodes?.values?.() || [])]
@@ -607,13 +641,6 @@ async function buildSnapshot(graph, root, options) {
         current.count += 1;
         impactLinks.set(key, current);
       }
-      if (!impactLinks.size) {
-        for (const module of selectedModules) {
-          impactLinks.set(`${nodeModule(root, focal)}\u0000${module}`, {
-            source: nodeModule(root, focal), target: module, kind: 'may affect', count: 1,
-          });
-        }
-      }
       impact = {
         focalModule: nodeModule(root, focal),
         modules: [...selectedModules],
@@ -621,11 +648,12 @@ async function buildSnapshot(graph, root, options) {
         edges: [...impactLinks.values()].slice(0, LIMITS.impactEdges),
         truncated: countsByModule.size > LIMITS.impactModules || impactLinks.size > LIMITS.impactEdges,
       };
+      impactStatus = impact.edges.length ? 'available' : 'no-relations';
     } catch {
-      warnings.push('无法查询所选入口的静态影响范围。');
+      addWarning('无法查询所选入口的静态影响范围。');
     }
   }
-  if (impact.truncated) warnings.push('影响图折叠了部分低优先级模块或关系。');
+  if (impact.truncated) addWarning('影响图折叠了部分低优先级模块或关系。', 'presentation');
 
   return {
     schemaVersion: 2,
@@ -646,9 +674,13 @@ async function buildSnapshot(graph, root, options) {
     paths: pathGraphs.map((pathGraph) => serializePath(root, pathGraph)),
     moduleFlows,
     impact,
+    impactStatus,
     unresolved,
     unresolvedCapped,
+    unresolvedStatus,
     warnings,
+    analysisWarnings,
+    presentationWarnings,
   };
 }
 
@@ -664,7 +696,9 @@ function flowToken(label) {
 function architectureMarkdown(snapshot, maxLinks = LIMITS.architectureEdges) {
   const { modules } = snapshot.architecture;
   const links = snapshot.architecture.links.slice(0, maxLinks);
-  if (!modules.length || !links.length) return '当前索引没有足够可信的跨模块关系可供连线展示，因此不绘制推测关系。';
+  if (!modules.length || !links.length) {
+    return '当前索引没有足够可信的跨模块关系可供连线展示，因此不绘制推测关系。“未识别到”不代表运行时一定不存在模块关系。';
+  }
   const lines = ['```flow LR'];
   for (const link of links) {
     if (link.source && link.target) {
@@ -677,24 +711,26 @@ function architectureMarkdown(snapshot, maxLinks = LIMITS.architectureEdges) {
     ? '当前 CodeGraph 版本没有可用的模块聚合结果，因此使用文件依赖关系作为回退依据。'
     : '连线来自索引中的模块级静态关系；低置信度关系不会绘制。');
   if (snapshot.architecture.truncated || links.length < snapshot.architecture.links.length) lines.push('部分低优先级模块或关系已折叠。');
+  lines.push('边上的标签表示关系类型；同一模块可能包含多个文件和职责。');
   return lines.join('\n');
 }
 
-function projectAreasMarkdown(snapshot) {
+function projectAreasMarkdown(snapshot, maxDirectories = Number.POSITIVE_INFINITY) {
   if (!snapshot.directories.length) return '';
-  const lines = ['## 项目主要区域 {span=2}', '', '```tree list', `${snapshot.project.name} | 已索引源码区域`];
-  for (const [directory, count] of snapshot.directories) {
+  const lines = ['```tree list', `${snapshot.project.name} | 已索引源码区域`];
+  const directories = snapshot.directories.slice(0, maxDirectories);
+  for (const [directory, count] of directories) {
     const depth = directory.split('/').length;
     const name = directory.split('/').at(-1);
     lines.push(`${'  '.repeat(depth)}${name}/ | ${count} 个源码文件`);
   }
   lines.push('```', '', '这张目录树只显示项目区域和文件数量，不列出单个文件或代码位置。');
-  if (snapshot.directoriesTruncated) lines.push('部分低优先级目录已折叠。');
+  if (snapshot.directoriesTruncated || directories.length < snapshot.directories.length) lines.push('部分低优先级目录已折叠。');
   return lines.join('\n');
 }
 
 function entrySurfacesMarkdown(snapshot) {
-  if (!snapshot.entries.length) return '当前索引未识别到可信的入口区域。';
+  if (!snapshot.entries.length) return '## 入口区域 {span=2}\n\n当前索引未识别到可信的候选入口，因此不绘制空图；真实运行入口无法确认。';
   const modules = new Map();
   for (const entry of snapshot.entries) modules.set(entry.module, (modules.get(entry.module) || 0) + 1);
   const lines = [
@@ -707,23 +743,24 @@ function entrySurfacesMarkdown(snapshot) {
   for (const [module, count] of modules) {
     lines.push(`${flowToken('推断入口')} -> ${flowToken(module)}: ${count} 个入口线索`);
   }
-  lines.push('```');
+  lines.push('```', '', '入口区域按静态筛选出的候选起点归属聚合；这不能确认真实触发者、请求类型或业务职责。');
   return lines.join('\n');
 }
 
 function moduleFlowMarkdown(snapshot, options) {
   const paths = snapshot.moduleFlows;
-  if (!paths.length) return '当前入口没有形成跨模块调用关系，因此此处不生成空图。';
+  if (!paths.length) return '## 跨模块流程概览 {span=2}\n\n当前所选入口没有形成可绘制的跨模块调用关系，因此不生成空图；这不能证明运行时没有跨模块交互。';
   const lines = [
     '## 跨模块流程概览 {span=2}',
     '',
-    `分析范围：${({ overview: '概览', full: '完整', symbol: '指定入口' })[options.scope] || options.scope} · 向下追踪深度：${options.depth}。每条流程最多分析 ${LIMITS.pathNodes} 个调用节点和 ${LIMITS.pathEdges} 条关系；这里只画跨模块调用。`,
+    `分析范围：${({ overview: '概览', full: '完整', symbol: '指定入口' })[options.scope] || options.scope} · 向下追踪深度：${options.depth}。每条流程最多分析 ${LIMITS.pathNodes} 个调用节点和 ${LIMITS.pathEdges} 条关系；这里只画跨模块静态调用。`,
   ];
-  paths.forEach(({ links, truncated }, index) => {
+  paths.forEach(({ links, folded, queryFailed }, index) => {
     lines.push('', `### 模块流程 ${index + 1}`, '', '```flow LR');
     for (const link of links) lines.push(`${flowToken(link.source)} -> ${flowToken(link.target)}: 调用${link.count > 1 ? ` · ${link.count} 条关系` : ''}`);
-    lines.push('```');
-    if (truncated) lines.push('', '部分次要调用分支已折叠。');
+    lines.push('```', '', '箭头表示聚合后的跨模块调用方向，不说明模块运行先后、条件分支或最终输出；这些行为无法仅凭此图确认。');
+    if (folded) lines.push('', '部分低优先级静态关系已折叠。');
+    if (queryFailed) lines.push('', '此路径有下游关系查询失败，跨模块流程可能不完整。');
   });
   return lines.join('\n');
 }
@@ -746,24 +783,21 @@ function functionLabels(nodes) {
   return labels;
 }
 
-function flowReadingNotes(pathGraph, calls) {
-  const outgoingCounts = new Map();
-  for (const link of calls.values()) {
-    outgoingCounts.set(link.source, (outgoingCounts.get(link.source) || 0) + 1);
+function flowReadingNotes(stage) {
+  const outgoingTargets = new Map();
+  for (const link of stage.edges) {
+    const targets = outgoingTargets.get(link.source) || new Set();
+    targets.add(link.target);
+    outgoingTargets.set(link.source, targets);
   }
-  const entryCalls = outgoingCounts.get(pathGraph.entry.id) || 0;
-  const branchCount = [...outgoingCounts.values()].filter((count) => count > 1).length;
-  const clauses = [
-    entryCalls
-      ? `入口连出 ${entryCalls} 条已识别的直接调用关系。`
-      : '入口没有解析到直接下游调用。',
-    branchCount
-      ? `图中有 ${branchCount} 个节点连接到多个下游方向，表示存在静态分支线索。`
-      : '图中没有识别到连接多个下游方向的节点。',
-    '箭头只表示静态调用关系；调用条件和运行时顺序需要结合源码逻辑理解。',
-  ];
-  if (pathGraph.truncated) clauses.push('部分次要分支因图表上限未显示。');
-  return `**流程解读：** ${clauses.join(' ')}`;
+  const multiTargetSources = [...outgoingTargets.values()].filter((targets) => targets.size > 1).length;
+  const depthLabel = stage.depth + 1;
+  const clauses = [`本图展示静态追踪第 ${depthLabel} 层中的 ${stage.edges.length} 条直接调用关系。`];
+  clauses.push(multiTargetSources
+    ? `${multiTargetSources} 个函数节点连接了多个目标；静态图无法区分这些目标是独立调用还是条件分支，也无法确认执行条件和顺序。`
+    : '本图没有显示连接多个目标的调用点。');
+  if (stage.parts > 1) clauses.push(`同一追踪层拆成 ${stage.parts} 张图以保持可读；图之间没有补加关系。`);
+  return `**本图怎么读：** ${clauses.join(' ')}`;
 }
 
 function functionCallFlowsMarkdown(snapshot, options) {
@@ -772,35 +806,43 @@ function functionCallFlowsMarkdown(snapshot, options) {
   }
   if (!snapshot.paths.length) return '没有识别到可信的调用入口，因此无法生成关键函数流程图。';
   const lines = [
-    '## 如何阅读 {span=2}',
+    '## 阅读说明 {span=2}',
     '',
-    `每张图从选中的入口开始，最多向下追踪 ${options.depth} 层；每条流程最多保留 ${LIMITS.pathNodes} 个节点和 ${LIMITS.pathEdges} 条调用关系。节点前缀是模块名，节点末尾保留源码中的函数名。`,
-    '箭头表示 CodeGraph 从源码中识别出的直接调用关系。一个节点连向多个节点表示存在多个静态分支，不代表每次运行都会执行全部分支或固定按图中顺序执行。',
+    `每个入口最多向下追踪 ${options.depth} 层；单条路径最多保留 ${LIMITS.pathNodes} 个节点和 ${LIMITS.pathEdges} 条关系。箭头表示 CodeGraph 识别出的静态直接调用关系，不保证运行顺序。`,
+    '多个箭头只表示发现多个静态调用目标，不能据此确认条件分支、先后顺序、正常返回值或异常处理。图中叶节点也不等同于业务流程的结束点。',
   ];
   let diagramCount = 0;
   for (const [index, pathGraph] of snapshot.paths.entries()) {
     const labels = functionLabels(pathGraph.nodes);
-    const calls = new Map();
-    for (const edge of pathGraph.edges.filter((item) => item.kind === 'calls')) {
-      if (!labels.has(edge.source) || !labels.has(edge.target)) continue;
-      const key = `${edge.source}\u0000${edge.target}`;
-      const link = calls.get(key) || { source: edge.source, target: edge.target, count: 0 };
-      link.count += 1;
-      calls.set(key, link);
-    }
-    lines.push('', `## 关键流程 ${index + 1} {span=2}`, '');
-    if (!calls.size) {
-      lines.push('这个入口没有解析到可确认的下游调用关系，所以不绘制空图。');
+    const calls = pathGraph.edges.filter((item) => item.kind === 'calls' && labels.has(item.source) && labels.has(item.target));
+    lines.push('', `## 关键流程 ${index + 1} {span=2}`, '',
+      '入口用途与实际触发场景无法仅从静态调用关系确认；此图表示结构分析选出的起点，不保证它就是用户请求或主要业务流程的入口。');
+    if (!calls.length) {
+      lines.push('', '当前入口没有解析到可确认的直接下游调用，因此不绘制空图。正常结果、失败结果和异常路径均无法由这组关系确认。');
       continue;
     }
-    lines.push('```flow LR');
-    for (const link of calls.values()) {
-      const count = link.count > 1 ? ` · ${link.count} 处调用` : '';
-      lines.push(`${flowToken(labels.get(link.source))} -> ${flowToken(labels.get(link.target))}: 调用${count}`);
+    const stages = splitCallPathIntoStages(pathGraph);
+    for (const stage of stages) {
+      const title = `### 静态追踪层 ${stage.depth + 1}${stage.parts > 1 ? ` · ${stage.part}/${stage.parts}` : ''}`;
+      lines.push('', title, '', '```flow LR');
+      const groupedEdges = new Map();
+      for (const edge of stage.edges) {
+        const key = `${edge.source}\u0000${edge.target}`;
+        groupedEdges.set(key, (groupedEdges.get(key) || 0) + 1);
+      }
+      for (const [key, count] of groupedEdges) {
+        const [source, target] = key.split('\u0000');
+        const evidence = count > 1 ? ` · ${count} 条静态关系` : '';
+        lines.push(`${flowToken(labels.get(source))} -> ${flowToken(labels.get(target))}: 调用${evidence}`);
+      }
+      lines.push('```', '', flowReadingNotes(stage));
     }
-    lines.push('```');
-    lines.push('', flowReadingNotes(pathGraph, calls));
-    lines.push('', `图中保留了 ${pathGraph.nodes.length} 个关键节点和 ${calls.size} 组调用关系。`);
+    const targets = new Set(calls.map((edge) => edge.target));
+    const sources = new Set(calls.map((edge) => edge.source));
+    const leafCount = [...targets].filter((id) => !sources.has(id)).length;
+    lines.push('', `本路径保留 ${pathGraph.nodes.length} 个节点和 ${calls.length} 条静态关系；各图按追踪层级拆分，共享的衔接节点均来自原图。${leafCount} 个节点在本次范围内没有已展示的后续调用；它们是否返回、抛错或产生业务输出无法确认。`);
+    if (pathGraph.folded) lines.push('', '部分低优先级调用关系已折叠。', `每个节点最多展示 ${LIMITS.callsPerNode} 个下游目标；路径还受节点和关系上限限制。详见“影响与边界”页。`);
+    if (pathGraph.queryFailed) lines.push('', '至少一次下游关系查询失败，这条路径可能不完整；失败后的运行行为无法确认。');
     diagramCount += 1;
   }
   if (!diagramCount) lines.push('', '所有已识别入口都没有可确认的下游调用关系。');
@@ -809,11 +851,14 @@ function functionCallFlowsMarkdown(snapshot, options) {
 
 function impactMarkdown(snapshot) {
   const { focalModule, modules, edges, depth, truncated } = snapshot.impact;
-  if (!focalModule || !modules.length || !edges.length) return '没有发现足够的静态影响关系可画；这不表示运行时一定没有影响。';
+  if (snapshot.impactStatus === 'not-requested') return '概览模式未执行静态影响查询，因此本报告无法确认影响范围。';
+  if (snapshot.impactStatus === 'no-entry') return '未识别到可用入口，未执行静态影响查询；当前无法确认影响范围。';
+  if (snapshot.impactStatus === 'query-failed') return '静态影响查询失败，无法确认影响范围。';
+  if (snapshot.impactStatus === 'no-relations' || !focalModule || !modules.length || !edges.length) {
+    return '在当前索引和所选深度内，没有获得可绘制的跨模块静态影响关系。这不表示运行时一定没有影响。';
+  }
   const lines = [
-    '## 静态影响范围 {span=2}',
-    '',
-    `CodeGraph 在深度 ${depth} 内识别到所选模块与另外 ${modules.length} 个区域之间的静态关系。`,
+    `CodeGraph 在深度 ${depth} 内识别到所选模块与另外 ${modules.length} 个区域之间的静态关系。箭头按静态关系方向绘制，不表示实际执行顺序或结果。`,
     '',
     '```flow LR',
   ];
@@ -828,19 +873,23 @@ function impactMarkdown(snapshot) {
 }
 
 function unresolvedMarkdown(snapshot) {
-  if (!snapshot.unresolved.length) return '在本次选取的调用流程中，没有发现需要单独标出的未解析引用。';
+  if (snapshot.unresolvedStatus === 'not-requested') return '概览模式未查询未解析引用，因此本报告无法确认这部分边界。';
+  if (snapshot.unresolvedStatus === 'no-path') return '没有可分析的调用路径，未解析引用查询没有运行；不能据此判断项目中是否存在未解析引用。';
+  if (snapshot.unresolvedStatus === 'unsupported') return '当前 CodeGraph 接口不支持未解析引用查询，本报告无法确认这部分边界。';
+  if (!snapshot.unresolved.length && snapshot.unresolvedStatus === 'complete') {
+    return '本次选取的调用路径未返回可汇总的未解析引用；这不代表项目其他区域没有此类引用。';
+  }
   const lines = [
-    '## 未解析引用边界 {span=2}',
-    '',
-    `所选流程中有 ${snapshot.unresolved.reduce((sum, item) => sum + item.count, 0)} 条未解析引用，分布在 ${snapshot.unresolved.length} 个模块。这里按模块汇总，不列出具体名称或源码位置。`,
+    `未解析引用表示静态引用无法可靠映射到已索引定义，不代表代码一定有错误。查询结果覆盖所选调用路径，并按模块和引用名称去重汇总。`,
     '',
     '```flow LR',
   ];
   for (const ref of snapshot.unresolved) {
-    lines.push(`${flowToken(ref.module)} -> ${flowToken('未解析引用')}: ${ref.count} 条`);
+    lines.push(`${flowToken(ref.module)} -> ${flowToken('未解析引用')}: ${ref.count} 种`);
   }
   lines.push('```');
-  if (snapshot.unresolvedCapped) lines.push('', `为控制图表大小，只显示前 ${LIMITS.unresolved} 条引用。`);
+  if (snapshot.unresolvedStatus === 'partial') lines.push('', '部分引用查询失败；图中只包含成功查询到的结果，完整边界无法确认。');
+  if (snapshot.unresolvedCapped) lines.push('', `为控制图表大小，只汇总最多 ${LIMITS.unresolved} 种不同引用；更多关系已折叠。`);
   return lines.join('\n');
 }
 
@@ -860,13 +909,13 @@ function navigationMarkdown(currentKey, pages) {
 }
 
 function pageDocument(snapshot, pages, key, heading, subtitle, body) {
+  const layout = selectPageLayout(key, snapshot, body);
   return `---
-template: sheet
+${layoutFrontmatter(layout)}
 theme: auto
 lang: zh-CN
 title: ${quoteYaml(`${snapshot.project.name} · ${heading}`)}
 subtitle: ${quoteYaml(`${subtitle} · ${snapshot.project.analyzedAt}`)}
-cols: 2
 ---
 ${navigationMarkdown(key, pages)}
 
@@ -888,6 +937,11 @@ function statsMarkdown(snapshot) {
 function overviewMarkdown(snapshot, options, pages) {
   const supplement = options.supplement ? fs.readFileSync(path.resolve(options.supplement), 'utf8') : '';
   const summary = supplement || `CodeGraph 已索引 ${snapshot.fileCount} 个文件，识别出 ${snapshot.architecture.modules.length} 个高置信度关系模块。下方图表概括目录区域和主要模块关系；具体职责需要结合项目说明与源码阅读。`;
+  const scopeLabels = {
+    overview: '项目概览；不展开函数调用和静态影响查询。',
+    full: '项目结构和有限数量的关键调用路径。',
+    symbol: '围绕指定入口筛选关键调用路径。',
+  };
   const pageRows = REPORT_PAGES.slice(1).map(({ key, label }) => {
     const descriptions = {
       architecture: '查看模块组成、依赖方向和跨模块概览。',
@@ -898,57 +952,57 @@ function overviewMarkdown(snapshot, options, pages) {
   }).join('\n');
   const body = `# 项目总览
 
-## 项目说明 {span=2}
+## 项目结论 {span=2}
 
 ${summary}
+
+**分析范围：** ${scopeLabels[options.scope] || options.scope}
+
+本报告用静态关系筛选重点模块和调用路径；它不保证运行时执行顺序，也不推测未被索引确认的业务结果。
 
 ## 项目规模 {span=2}
 
 ${statsMarkdown(snapshot)}
 
-本报告将函数级关系用于筛选和追踪关键路径；总览与架构图按模块归纳，函数调用图节点保留源码函数名，页面中不列文件和行号清单。
+## 项目区域 {span=2}
 
-${projectAreasMarkdown(snapshot)}
-
-${entrySurfacesMarkdown(snapshot)}
+${projectAreasMarkdown(snapshot, 8) || '索引中没有可展示的目录区域。'}
 
 ## 架构速览 {span=2}
 
 ${architectureMarkdown(snapshot, 7)}
 
-## 子页面 {span=2}
+## 阅读路线 {span=2}
 
 | 页面 | 阅读内容 |
 | --- | --- |
 ${pageRows}
 
-## 阅读提示
-
-所有连线均来自静态源码分析。它们说明源码中识别到的结构关系，不等同于某次运行中的固定执行轨迹。`;
+函数名称只出现在关键调用流程图中；其他页面按项目区域和模块关系组织，不列源码位置清单。`;
   return pageDocument(snapshot, pages, 'overview', '项目总览', '项目结构、重点模块和阅读导航', body);
 }
 
 function architecturePageMarkdown(snapshot, options, pages) {
-  const areas = projectAreasMarkdown(snapshot).replace(/^## 项目主要区域 \{span=2\}\n\n/, '') || '索引中没有可展示的目录区域。';
+  const areas = projectAreasMarkdown(snapshot) || '索引中没有可展示的目录区域。';
   const body = `# 项目架构图
 
-## 目录与代码区域 {span=2}
+此页先展示项目区域，再呈现模块关系和候选入口。箭头说明静态关系方向，不能确认模块的运行先后或业务职责。
+
+## 项目区域 {span=2}
 
 ${areas}
 
-## 模块关系图 {span=2}
+## 模块关系 {span=2}
 
 ${architectureMarkdown(snapshot)}
-
-图中的“依赖、调用、导出”等文字说明模块关系类型。一个模块可能包含多个文件和多项职责；页面只显示聚合后的高置信度关系，不展开单个文件。
 
 ${entrySurfacesMarkdown(snapshot)}
 
 ${moduleFlowMarkdown(snapshot, options)}
 
-## 如何使用这张图
+## 阅读建议
 
-先从入口区域定位主要起点，再沿箭头查看模块之间的依赖和调用方向。跨模块流程是从函数级调用关系聚合得到的概览；需要查看具体函数名时，打开“函数调用流程”页。`;
+先从项目区域定位模块，再按关系标签阅读依赖方向。入口图只展示静态筛选出的候选起点；跨模块流程只展示已识别的调用关系。需要看源码函数名称时，打开“函数调用流程”页。`;
   return pageDocument(snapshot, pages, 'architecture', '项目架构图', '模块组成、关系方向和架构阅读说明', body);
 }
 
@@ -957,34 +1011,52 @@ function functionCallFlowsPageMarkdown(snapshot, options, pages) {
 
 ${functionCallFlowsMarkdown(snapshot, options)}
 
-## 分析边界
+## 无法从调用图确认的内容
 
-CodeGraph 根据静态源码信息识别调用边。动态分派、反射、运行时注入或生成代码可能造成遗漏；流程图用于理解主要路径，不保证覆盖全部运行情况。节点采用源码函数名称，并以模块名帮助区分；页面不附带文件路径或行号清单。`;
+静态调用关系不能说明正常返回值、用户可见输出、异常处理或失败后的恢复行为。动态分派、反射、运行时注入和生成代码也可能造成遗漏；图表用于定位值得阅读的路径，不保证覆盖全部运行情况。源码函数名只显示在图中，页面不附带文件路径或行号清单。`;
   return pageDocument(snapshot, pages, 'flows', '关键函数调用流程', '保留源码函数名的关键静态调用关系图', body);
 }
 
 function detailsPageMarkdown(snapshot, options, pages) {
-  const warningRows = snapshot.warnings.length
-    ? snapshot.warnings.map((warning) => `- ${warning}`).join('\n')
-    : '- 索引已完成，本次没有其他重要警告。';
+  const analysisWarnings = snapshot.analysisWarnings || snapshot.warnings || [];
+  const presentationWarnings = snapshot.presentationWarnings || [];
+  const indexStateLabels = { complete: '已完成', partial: '部分完成', indexing: '正在索引', stale: '已过期' };
+  const state = snapshot.project.indexState || 'unknown';
+  const warningList = (items, empty) => items.length ? items.map((warning) => `- ${warning}`).join('\n') : `- ${empty}`;
   const body = `# 影响范围与分析边界
 
-${options.scope === 'overview' ? '概览模式不展开影响范围与未解析引用分析。' : impactMarkdown(snapshot)}
+本页说明索引状态、当前查询结果和图表展示上限。未绘制关系不等于运行时不存在。
 
-${options.scope === 'overview' ? '' : unresolvedMarkdown(snapshot)}
+## 索引与分析状态 {span=2}
 
-## 本次分析提示 {span=2}
+当前索引状态：**${indexStateLabels[state] || (state === 'unknown' ? '未知' : state)}**。
 
-${warningRows}
+${warningList(analysisWarnings, '本次索引和关系查询没有其他已知警告。')}
+
+## 图表范围与折叠 {span=2}
+
+${warningList(presentationWarnings, '当前图表没有因展示上限折叠关系。')}
+
+- 架构图最多显示 ${LIMITS.architectureModules} 个模块和 ${LIMITS.architectureEdges} 条关系。
+- 每条调用路径最多显示 ${LIMITS.pathNodes} 个节点和 ${LIMITS.pathEdges} 条关系。
+- 每个调用节点最多显示 ${LIMITS.callsPerNode} 个优先级较高的下游目标。
+- 影响图最多显示 ${LIMITS.impactModules} 个模块和 ${LIMITS.impactEdges} 条关系。
+- 未解析引用图最多汇总 ${LIMITS.unresolved} 种不同引用名称；数量按模块和名称去重。
+
+## 静态影响范围 {span=2}
+
+${impactMarkdown(snapshot)}
+
+## 未解析引用 {span=2}
+
+${unresolvedMarkdown(snapshot)}
+
+## 排除范围与解释边界
 
 - 测试、样例、文档、第三方依赖、生成代码、mock 和构建目录会从主要结构图中排除。
-- 明显的语言运行时引用会从未解析引用图中省略，以减少噪声。
-- 静态调用边表示源码分析发现了关系，不代表每次运行都会经过该路径。
-- 图表有节点和关系数量上限；发生折叠时会在对应页面注明。
-
-## 如何理解未解析引用
-
-未解析引用表示 CodeGraph 无法把某个静态引用可靠地连到已索引定义。它可能来自外部依赖、动态调用或索引范围之外的代码；图中按模块计数，不猜测具体目标。`;
+- 常见语言运行时名称会从未解析引用图中省略，以减少噪声。
+- 未解析引用表示引用无法可靠映射到已索引定义，不代表项目代码一定有错误。
+- 关系和计数仅覆盖当前索引及已选入口；“未识别到”不代表“没有发生”。`;
   return pageDocument(snapshot, pages, 'details', '影响与分析边界', '静态影响、未解析引用和索引限制', body);
 }
 
