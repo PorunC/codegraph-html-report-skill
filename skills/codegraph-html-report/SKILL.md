@@ -1,67 +1,53 @@
 ---
 name: codegraph-html-report
-description: Analyze a local source project with CodeGraph and generate a readable, multi-page offline HTML report with architecture diagrams, key function call flows, and analysis limits.
+description: Read a local project and create an evidence-backed, multi-page offline HTML architecture and workflow report.
 ---
 
-# CodeGraph HTML Report
+# Project Source Analysis HTML Report
 
-Use this skill when the user asks for a readable project/codebase analysis document, architecture overview, module flow or dependency map, or HTML report generated from source code.
+Use this skill when the user wants a readable project analysis report with architecture or workflow diagrams. The Skill agent reads project sources and documentation, writes structured findings, then runs a local renderer. The generator validates JSON and produces Markdown and HTML; it does not call a model API or analyze source code itself.
 
-## Outcome
+## Output
 
-Produce a self-contained offline report directory. The report must be useful without a running server or network connection and must contain:
+Create four self-contained pages under `.codewiki/reports/source-analysis-report-<timestamp>/`:
 
-- `index.html`: project summary, project areas, architecture preview, and links to the child pages;
-- `architecture.html`: project-area tree, module architecture, entry areas, and cross-module flow overview;
-- `call-flows.html`: one to three focused function call flow diagrams using source function names, with plain-language reading guidance;
-- `details.html`: static impact, unresolved-reference boundary, and analysis limits.
+- `index.html`: project scope, main conclusions, and links to the report sections;
+- `architecture.html`: major areas, responsibilities, and only evidence-backed area relationships;
+- `call-flows.html`: selected workflows with source-backed steps and relations;
+- `details.html`: analysis scope, entry clues, extension points, risks, evidence limits, and unknowns.
 
-The default output is `.codewiki/reports/codegraph-report-<timestamp>/index.html` in the analyzed project. A directory passed to `--output` receives these four pages; a `.html` path remains supported as the overview page and places sibling pages beside it. Do not start an HTTP server, expose a port, upload source code, execute project code, or edit project source files.
+The pages use relative navigation and must work from `index.html` opened with `file://`. A `.html` `--output` path remains supported as the overview page, with sibling pages beside it.
 
 ## Workflow
 
-1. Resolve the project path. If the user did not provide one, use the current working directory. Confirm that it is a readable directory.
-2. Check that Node.js is 22.5 or newer. The CodeGraph library needs this runtime. If the local skill dependencies are absent, run `npm install --prefix <this-skill-directory>` to install its pinned dependencies; do not install project dependencies or run project scripts.
-3. Inspect the project's README, package manifests, build/config files, and obvious entrypoints. Write a short temporary Markdown supplement with a human-readable, module-level architecture narrative (technology stack, module responsibilities, execution flow, extension points, tests/build/deploy entrypoints, and observed risks). Do not name individual functions or list files/line locations. Pass it with `--supplement`; do not guess details that are not supported by the files.
-4. Run `scripts/generate_report.mjs` with the project path, output path, optional `--symbol`, `--depth`, `--scope`, and `--supplement` arguments. The script opens or creates the project's `.codegraph` index, extracts a bounded report snapshot, writes four Markdown drafts, and renders four linked HTML pages with the locally installed `answer-me-with-html` CLI.
-5. Keep CodeGraph's progress visible, but keep the final response short: report the absolute `index.html` path, report directory, project statistics, and material warnings.
-6. Verify that all four pages exist, are non-empty, contain their page titles, use local relative links, and have no external resource loads. Remove temporary Markdown drafts and supplements after successful rendering.
+1. Resolve the project root from the request or current working directory. Do not inspect outside it unless the user explicitly includes an external document.
+2. Read the project README and package/build configuration. Then inspect relevant entry setup, major source areas, and tests or deployment configuration when they clarify behavior. Scale the reading to project size. Do not claim an exhaustive audit unless the full scope was actually reviewed.
+3. Draft findings from source and project documentation. Record the reviewed scope, exclusions, evidence files, and unresolved questions. Distinguish statements directly supported by code from interpretive judgments.
+4. Build a temporary JSON file that follows [references/source-analysis.schema.json](references/source-analysis.schema.json). Use project-relative evidence paths that exist. Keep source notes concise. Do not create function, file, or line-location inventories. Keep the number of items within the schema bounds and prioritize high-value content instead of truncating it later.
+5. Draw an architecture or flow edge only when the JSON includes a concrete source citation for that relationship, including at least one `direct` evidence item. Do not infer behavior from names, directory layout, framework conventions, or neighboring nodes. Put uncertain behavior in `unknowns` or prose, not in a confirmed edge. Use concise, human-readable action labels for flow nodes; do not expose source function names or create function/location inventories.
+6. Invoke the local generator with `--analysis <json>` and `--project <root>`. The generator validates the contract and cited files, writes four Markdown drafts, and renders four offline HTML pages with the locally installed `answer-me-with-html` CLI. It never scans or indexes the source project.
+7. Check that all pages exist and are non-empty, titles and relative links work, and no external resources remain. Remove only temporary JSON and draft files created for this run after successful generation.
+8. Report the absolute `index.html` path, a short description of the reviewed scope, and any material unknowns or analysis limits.
 
-Read [references/codegraph-api.md](references/codegraph-api.md) when changing the extraction script or adding a new graph section. Read [references/report-format.md](references/report-format.md) when changing the Markdown panels or diagram syntax.
+Do not install project dependencies, execute project scripts, start a server, upload source, or modify project source files. Do not install, run, or require CodeGraph. Do not create, update, or delete a `.codegraph/` directory; leave any pre-existing index untouched.
 
-## Analysis rules
+## Writing and diagram rules
 
-- Prefer CodeGraph's public API over direct SQLite access.
-- Use `CodeGraph.open()` for an existing index and `CodeGraph.init()` for a project without one. Close the graph in a `finally` block.
-- Treat `calls`, `imports`, and impact results as static-analysis evidence. Do not describe a static edge as a runtime guarantee.
-- Prefer CodeGraph's module aggregation for architecture. Use file-pair fallback only when aggregation is unavailable, and state that fallback in the report.
-- Select entry candidates from executable file roots, routes/components, exported symbols, and conventional entry names. Use fan-in/fan-out only as ranking signals. Do not merge unrelated symbols just because they share a name.
-- Build each focused path separately and follow downstream `calls` edges. Keep both a module-level aggregation for architecture pages and a bounded function-level representation for `call-flows.html`.
-- Keep CodeGraph IDs, hashes, synthetic names, source locations, and function/location inventory tables out of the overview, architecture, and details pages. The key call-flow diagrams may show source function names, prefixed by their module; keep names on diagram nodes instead of repeating them in explanatory prose or a function inventory.
-- Translate graph relationship kinds into plain Chinese reader-facing labels and explain what arrows and branches mean. Avoid source dumps and file/location lists.
-- Keep graph output bounded for reading: at most 8 architecture modules, 14 architecture links, 3 entry paths, 2 downstream targets per call node, 10 nodes and 14 edges per path, 8 impact modules, 14 impact links, and 12 unresolved-reference names. Preserve a visible warning when secondary relationships are folded out.
-- Show unresolved references and incomplete/partial index state in the report. Never invent a callee or silently drop an analysis warning.
-- Keep the report at project/module level outside the function-flow diagrams; do not expand individual file paths or line numbers into lists.
-- Embed all page data, CSS, SVG, and JavaScript in each output file. Page navigation must use relative links and work when `index.html` is opened with `file://` after the command exits.
+- Lead the overview with the project's supported purpose and the scope actually reviewed.
+- Explain area responsibilities in plain language. Use architecture arrows only for relationships present in the analysis JSON with source evidence.
+- Explain every diagram's arrows and limits nearby. `source-analysis.json` is an agent-produced interpretation of the reviewed files, not runtime tracing.
+- Do not present a sequence unless its order is supported by code. A node without a drawn outgoing edge is not necessarily a business endpoint.
+- Keep evidence attached to the claim or edge it supports. Cite a concise project-relative source path; do not turn evidence into a function, file, or line-location inventory.
+- Mark interpretations distinctly from direct source facts. Interpretive-only relationships must not appear as definite graph edges.
+- State unknowns clearly. Do not invent a business result, failure path, return value, or framework behavior.
+- Select `sheet` for compact parallel content and `doc` when readers need a longer sequence. Keep layout selection deterministic; only `sheet` frontmatter has `cols`.
+- Keep diagrams bounded and readable. If relationships are omitted, state that they were omitted and why.
 
-## Report writing
-
-Write each page for a reader who has not seen the source index. Lead with the page's conclusion or purpose, then organize material in the order the reader needs it.
-
-- Keep the overview short. State the analysis scope and main conclusion first, show a compact architecture preview, and link to the page that answers each next question.
-- Organize architecture as project areas, module relationships, candidate entry areas or cross-module paths, then a short reading guide. Explain arrows beside the diagram.
-- Introduce each call-flow diagram as a structurally selected candidate path. Static entry selection does not establish the user's trigger or business purpose. Split long diagrams into static call-depth layers using only the original nodes and edges; a real node may appear in adjacent diagrams as a boundary. Layer numbers do not imply runtime phases. Never add a synthetic continuation node or relation.
-- Explain that multiple outgoing edges identify multiple static targets, not proven conditional branches or execution order. State when normal outputs, return values, exception paths, or recovery behavior cannot be confirmed. A leaf in a bounded graph is not a confirmed business endpoint.
-- Place impact, unresolved-reference, index-state, exclusion, and folding explanations next to the relevant diagram or in the details page. Distinguish analysis/index warnings from visual folding notices.
-- Select `sheet` for compact parallel summaries and `doc` for content that needs sequential reading. Keep the choice deterministic and omit `cols` from `doc` frontmatter.
-- Use diagrams for project areas, module relationships, candidate entry areas, cross-module paths, key function calls, impact, and unresolved boundaries. Keep function names only on key call-flow diagram nodes, prefixed with their module. Do not repeat them in prose or add function, file, or location inventories.
-- Hide empty diagrams and state why they are absent. Keep folded relationship notices visible; never shrink or overfill a diagram to imply completeness.
-
-Do not infer a business result, exception path, or runtime ordering from a static graph. When the available snapshot cannot support a statement, say “无法确认” or “未识别到” and explain the scope that was checked. Read [references/report-format.md](references/report-format.md) when editing page structure, layout rules, or diagrams.
+Read [references/report-format.md](references/report-format.md) when changing page structure or diagram syntax. Read the schema when preparing the JSON handoff or changing data validation.
 
 ## Failure handling
 
-- A missing or invalid project path is an actionable error; do not generate an empty report.
-- A local parse failure for some files should produce a report with a warning when CodeGraph can finish indexing.
-- A failed index, missing renderer, or failed HTML write should return a non-zero exit status and identify the corrective action.
-- Never fall back to an invented graph when CodeGraph is unavailable.
+- `--analysis` is required. Missing, malformed, structurally invalid, or unsupported evidence paths must produce a non-zero exit and an actionable message without rendering an empty report.
+- A missing local renderer must produce a non-zero exit and name the Skill dependency install command.
+- A failed render or offline-link check must return a non-zero exit. Preserve user-provided analysis JSON and explicit draft directories.
+- Do not fall back to inferred graph data when a citation or relationship is missing.

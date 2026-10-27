@@ -1,59 +1,52 @@
 # Report format
 
-The generator writes four Markdown drafts and renders them with the local `answer-me-with-html` CLI. Keep links between pages relative so the report opens from `index.html` with `file://` and no server. If `--output` is a `.html` path, use it as the overview and place the other pages beside it with `-architecture`, `-call-flows`, and `-details` suffixes.
+The Skill agent prepares a structured `source-analysis.json`; the local generator validates it and renders four Markdown drafts with the bundled `answer-me-with-html` CLI. The JSON contract is defined in [source-analysis.schema.json](source-analysis.schema.json). Keep page links relative so the report opens from `index.html` with `file://` and no server.
+
+The generator command is:
 
 ```bash
-node node_modules/answer-me-with-html/bin/am.js render draft.md -o page.html --no-open
+node scripts/generate_report.mjs --project /path/to/project --analysis /path/to/source-analysis.json --output /path/to/report
 ```
 
-Use this page structure and keep the navigation on all four pages:
+Use four pages: project overview, architecture, key workflows, and evidence/limits. Each page keeps navigation links to the other three pages.
 
-````markdown
+## Page layout
+
+- Use `sheet` for a compact overview, a few parallel summaries, or a short architecture page. Add `cols` only for this template.
+- Use `doc` for architecture pages with several diagram sections, multiple or long workflows, or details that need a clear reading order. Do not add `cols` to `doc` frontmatter.
+- The deterministic selector uses the validated analysis data and generated Markdown. It does not inspect or rescan project source.
+- Both templates keep the same title, subtitle, language, theme, and relative navigation.
+
+```markdown
 ---
 template: sheet
 theme: auto
 lang: zh-CN
-title: Project architecture report
-subtitle: Static analysis snapshot
+title: Project report
+subtitle: Source review
 cols: 2
 ---
-**报告导航：** **总览**　·　[架构图](architecture.html)　·　[函数调用流程](call-flows.html)　·　[影响与边界](details.html)
+**报告导航：** **总览**　·　[架构图](architecture.html)　·　[关键流程](call-flows.html)　·　[证据与边界](details.html)
 
 # Page title
 
 ## Diagram panel {span=2}
 
 ```flow LR
-src/api -> src/core: 依赖
+API -> Storage: 直接依赖 · 依据 1
 ```
-````
+```
 
-Choose a layout from the content shape rather than fixing every page to the same grid:
+## Evidence and diagrams
 
-- `sheet` is for a compact overview, a few parallel summaries, or a short architecture page. Set `cols` only for this template.
-- `doc` is for architecture pages with several diagram sections, multiple or long call paths, or details that need a clear reading order. Do not add `cols` to a `doc` frontmatter block.
-- Keep the choice deterministic and base it on the existing snapshot and generated Markdown. Do not rescan the project to select a template.
-- Both templates retain the same title, subtitle, theme, language, and relative page navigation.
+Every relationship in a diagram must have a concrete citation in the input JSON and at least one `direct` evidence item. Interpretive-only relationships belong in prose, not diagrams. A relationship without direct evidence is invalid and must not be drawn.
 
-````markdown
----
-template: doc
-theme: auto
-lang: zh-CN
-title: Project architecture report
-subtitle: Static analysis snapshot
----
-**报告导航：** **总览**　·　[架构图](architecture.html)　·　[函数调用流程](call-flows.html)　·　[影响与边界](details.html)
+Use `tree` for area hierarchy and responsibility, `flow` for evidence-backed relationships, and `sequence` only when interaction order is supported by source code. Diagram nodes represent the supplied labels; do not infer missing edges from naming or common framework patterns.
 
-# Page title
+Keep a concise project-relative source path near each claim or diagram edge it supports. Evidence notes should explain what the source supports in plain language, not reproduce source code. Use short action labels for flow nodes; do not expose exact source function names or list code locations in the report. The analysis JSON may retain a location internally to help validate the agent's evidence, but the renderer omits that field from reader-facing pages.
 
-## A reading section
+For workflows, list the source-backed steps and draw only explicit edges from the JSON. If the steps have evidence but no supported transition, show them as notes without a connected flow diagram. State unknown behavior beside the relevant flow. Do not infer a normal result, failure result, exception path, or runtime ordering from a component name or directory structure.
 
-Read sections in order. Use headings to make a long page easy to scan.
-````
+Keep the overview concise. Put project scope, main conclusions, and the reading route first. Explain responsibilities on the architecture page and explain analysis coverage, exclusions, risks, and unknowns on the details page.
 
-Use separate pages for the project overview, architecture, key function call flows, and impact/analysis limits. Keep the overview short and direct readers to the child page that answers each next question. Organize architecture as project areas, module relationships, candidate entry areas or cross-module paths, then a short reading guide.
-
-For each key call path, explain that the entry is a static structural candidate whose user-facing trigger and business purpose may be unknown. Split a long path into static call-depth layers using only nodes and edges already present in the snapshot. A real node may appear in adjacent diagrams as a boundary; layer numbers do not imply runtime phases. Do not add a synthetic continuation node or relation. Explain that multiple outgoing edges are multiple static targets, not proof of a runtime condition or execution order. A terminal node in a bounded graph does not prove a business endpoint. State when normal output, return values, exception behavior, or recovery paths cannot be confirmed.
-
-Explain each diagram beside it: what arrows represent, what a visible fan-out means, and what the graph cannot confirm. Distinguish analysis/index warnings from display limits. Keep index state, unresolved-reference scope, excluded areas, and folded relationships visible. Hide diagrams with no useful relationships and explain why they are absent. Do not put remote URLs in HTML blocks or Markdown image references.
+Do not add remote resources, external stylesheets, scripts, fonts, or images. The final HTML must work offline with relative links between the four pages.

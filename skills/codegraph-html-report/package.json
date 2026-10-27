@@ -1,9 +1,11 @@
 {
-  "name": "codegraph-html-report-skill-runtime",
+  "name": "source-analysis-html-report-skill-runtime",
   "private": true,
   "type": "module",
+  "scripts": {
+    "test": "node --test scripts/*.test.mjs"
+  },
   "dependencies": {
-    "@colbymchenry/codegraph": "1.6.2",
     "answer-me-with-html": "https://codeload.github.com/QingYunA/answer-me-with-html/tar.gz/76c3c6d39270138f3dfa6d577a3afb02178b3a1d"
   }
 }

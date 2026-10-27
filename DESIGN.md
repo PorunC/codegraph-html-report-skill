@@ -1,122 +1,96 @@
-# CodeGraph HTML Report Skill 设计
+# Source Analysis HTML Report Skill 设计
 
 ## 目标
 
-把项目分析做成一个 Codex Skill。用户调用 `$codegraph-html-report` 后，Skill 在本地读取当前项目，调用 CodeGraph 分析源码，再用 Answer me with HTML 渲染一份完整、可离线阅读的 HTML 架构报告。
-
-典型调用：
+用户调用 `$codegraph-html-report` 后，Skill Agent 阅读本地项目的源码和文档，产出有依据的结构化分析 JSON；本地生成器校验 JSON 并使用 Answer me with HTML 渲染四页离线报告。
 
 ```text
-使用 $codegraph-html-report 分析这个项目，并生成完整的 HTML 架构文档。
+Agent 阅读源码与文档
+        ↓
+source-analysis.json
+        ↓
+结构与证据校验
+        ↓
+四份 Markdown 草稿
+        ↓
+本地 Answer me with HTML
+        ↓
+四页离线报告
 ```
 
-默认生成一个报告目录，总览页面位于：
+默认总览页：
 
 ```text
-.codewiki/reports/codegraph-report-<timestamp>/index.html
+.codewiki/reports/source-analysis-report-<timestamp>/index.html
 ```
 
-## 运行边界
+## 职责边界
 
-- 只在本机运行，不启动 HTTP 服务，不跨机器访问。
-- 不上传源码，不执行被分析项目的脚本，不安装被分析项目的依赖。
-- CodeGraph 只写项目自己的 `.codegraph/` 索引目录。
-- 总览和架构页面使用模块级图表；关键调用流程图在节点上保留少量源码函数名，不在说明文字中重复列名，也不列具体文件或代码位置。
-- 每个 HTML 页面都内嵌 CSS、SVG 和脚本，页面间使用相对链接，脱离网络也可直接打开。
+### Skill Agent
 
-## Skill 结构
+- 阅读 README、项目配置、关键目录与相关实现；按规模决定阅读深度。
+- 用项目相对路径和位置描述记录结论依据。
+- 区分源码直接确认和上下文解释，保留未知项与分析排除范围。
+- 只在关系有具体源码依据时将其写成可视化边；不能根据名字、目录结构或框架惯例补图。
+- 不运行被分析项目脚本，不上传源码，不启动服务。
 
-```text
-skills/codegraph-html-report/
-├── SKILL.md
-├── agents/openai.yaml
-├── package.json
-├── package-lock.json
-├── references/
-│   ├── codegraph-api.md
-│   └── report-format.md
-└── scripts/
-    └── generate_report.mjs
-```
+### 本地生成器
 
-### SKILL.md
+- 读取并校验 `source-analysis.json` 及其项目相对证据路径。
+- 根据经过校验的数据生成 Markdown 和四页 HTML。
+- 校验页面标题、本地链接和外部资源引用。
+- 不调用模型 API、不读取源码来做分析、不加载 CodeGraph、不访问或修改 `.codegraph/`。
 
-定义调用场景、输出要求和执行流程。Skill 被调用后会：
+## 数据契约
 
-1. 确认项目路径和 Node.js 版本。
-2. 阅读 README、包管理文件、配置文件和明显入口，形成架构补充说明。
-3. 运行报告生成脚本。
-4. 检查总览与所有子页完整、页面导航可用、可离线打开，并输出总览路径。
+`skills/codegraph-html-report/references/source-analysis.schema.json` 规定以下内容：
 
-### generate_report.mjs
+- 项目名称、摘要和真实分析范围；
+- 有依据的主要发现、区域和关系；
+- 入口线索、关键流程步骤和有证据支持的步骤关系；
+- 扩展点、风险、未知项与分析限制；
+- 依据文件、仅供内部核对的位置、简短说明和证据类型。渲染报告时不展示具体位置字段，也不列函数或代码位置清单。
 
-负责可重复的分析和渲染：
+数据校验除了 JSON 字段外，还检查区域 ID 与流程步骤 ID、关系端点、证据类型、引用路径安全性和文件存在性。每条关系边至少要有一条 `direct` 依据。解释性判断可以作为文字结论保留，但不会单独成为确定的图边。没有证据的流程步骤或边会导致校验失败。
 
-1. 用 `CodeGraph.isInitialized()` 判断是否已有索引。
-2. 使用 `CodeGraph.open()` 打开已有索引，或用 `CodeGraph.init()` 建立索引。
-3. 提取统计、入口候选、模块聚合关系、关键下游路径、影响范围和未解析引用。
-4. 生成总览、架构、关键函数调用流程、影响与边界四份 Markdown 草稿。
-5. 调用本地 `answer-me-with-html` CLI，分别渲染为相互链接的 HTML。
-6. 检查页面标题、本地相对导航、文件大小和外部资源引用。
-7. 关闭 CodeGraph 并清理临时草稿。
+## 报告结构
 
-## 报告内容
+- `index.html`：项目范围、结论、主要发现和阅读路线。
+- `architecture.html`：区域职责树和有依据的区域关系图；没有关系时显示原因。
+- `call-flows.html`：来源明确的步骤和关系图；未确认行为作为未知项。
+- `details.html`：入口线索、扩展点、风险、证据、分析范围及限制。
 
-报告目录包含以下页面：
+四页用相对链接导航。所有资源内嵌，可从 `index.html` 离线打开。版式由已有数据和 Markdown 大小确定：简短并列内容用 `sheet`，长内容用 `doc`；只有 `sheet` 设置 `cols`。
 
-- `index.html`：项目规模、区域目录图、入口区域、架构速览和子页导航。
-- `architecture.html`：项目目录、模块依赖、入口和跨模块流程概览。
-- `call-flows.html`：最多三条关键下游函数调用图；节点使用源码函数名，模块名作为上下文。
-- `details.html`：静态影响图、未解析引用图和分析限制。
+## 依赖与运行
 
-### 可读性约束
-
-- 总览和架构图不展开函数清单；只有关键流程子页显示源码函数名，不附文件路径或行号列表。
-- 流程图只在节点上按模块标记关键函数名，用中文解释调用边和分支，并明确静态分析边界；正文不重复列举函数清单。
-- 目录图、架构图、关键调用图、静态影响图和未解析引用图分布在独立页面，避免把所有信息堆在一页。
-- 没有可信关系时解释原因，不生成空图或推测连线。
-
-## 默认限制
-
-- 架构图最多 8 个模块、14 条关系。
-- 最多 3 条入口路径，每条最多 10 个内部节点、14 条边；关键流程页显示筛选后的函数级关系。
-- 静态影响图最多 8 个模块、14 条关系。
-- 未解析边界最多聚合 12 个未解析引用。
-- `--depth` 支持 1 到 6，默认 2。
-
-超出限制时必须在报告里明确说明，不能静默丢弃关系。
-
-## 可选参数
+- Node.js `>=20`。
+- Skill 自身固定版本的 `answer-me-with-html` 渲染器。
+- 不依赖项目依赖，不安装或运行 CodeGraph。
 
 ```bash
+npm install --prefix skills/codegraph-html-report
 node skills/codegraph-html-report/scripts/generate_report.mjs \
   --project ./project \
-  --output ./project-report \
-  --symbol main \
-  --depth 2 \
-  --scope full \
-  --supplement /tmp/architecture-notes.md
+  --analysis ./source-analysis.json \
+  --output ./project/.codewiki/reports/my-report
 ```
 
-- `--scope overview`：只生成总览和架构内容，关键流程页会说明未展开调用分析。
-- `--scope symbol --symbol <name>`：围绕指定符号生成报告。
-- `--supplement <md>`：加入 Skill 根据项目文档和源码撰写的架构说明。
+`--analysis` 必填。格式错误、字段缺失、证据路径无效、渲染器缺失或页面检查失败都会返回非零状态。失败时不会生成一份伪造的空分析报告。
 
-## 依赖
+## 本地文件边界
 
-Skill 锁定以下版本：
+- 分析 JSON 可由 Agent 临时写入项目 `.codewiki/tmp/`；成功后仅清理本次生成的临时文件。
+- 生成器在 `.codewiki/tmp/` 写 Markdown 草稿，在 `.codewiki/reports/` 写 HTML。
+- 不创建、更新或删除已有 `.codegraph/`，也不扫描该目录。
+- 报告默认不会上传或启动服务；用户可直接离线浏览 HTML。
 
-- `@colbymchenry/codegraph@1.6.2`
-- `answer-me-with-html@76c3c6d`（GitHub 固定 commit 的 tarball，因为该项目当前不是 npm registry 包）
-- Node.js `>=22.5`
+## 验证
 
-依赖安装在 Skill 自己的目录中，不进入被分析项目的依赖树。
+运行以下命令执行结构校验、布局测试和报告生成集成测试：
 
-## 已验证行为
+```bash
+node --test skills/codegraph-html-report/scripts/*.test.mjs
+```
 
-在当前 `codewiki` 项目上执行了完整流程：
-
-- CodeGraph 成功建立/更新索引。
-- 成功生成总览、架构、函数调用流程、影响与边界四个 HTML 页面。
-- 页面导航使用相对链接，各页面可以直接离线打开，没有外部资源引用。
-- 生成器通过 Node.js 语法检查，并在多模块示例项目上验证页面内容和调用图命名。
+测试覆盖合法与非法 JSON、证据和未知项、布局选择、无关系输入、四页输出、离线链接和渲染失败退出码，并确认生成器不会创建 `.codegraph/`。
